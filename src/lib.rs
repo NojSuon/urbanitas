@@ -17,6 +17,7 @@
 //! assert!(obj.obj.contains("usemtl plaster"));
 //! ```
 
+pub mod design;
 pub mod export;
 pub mod generate;
 pub mod geometry;
@@ -33,6 +34,7 @@ pub mod terrain;
 pub mod texture;
 pub mod town;
 
+pub use design::{Design, update_copies};
 pub use generate::generate;
 pub use landscape::{LandscapeParams, Relief, WaterBody, generate_landscape, landscape_layout};
 pub use model::Building;
@@ -41,4 +43,4 @@ pub use params::{
 };
 pub use parts::{Layout, Part, PartKind};
 pub use site::{Context, SiteParams, generate_site};
-pub use town::{TownParams, fill_street, grow_town, suggest_piazza};
+pub use town::{DesignMix, TownParams, fill_street, grow_town, suggest_piazza};

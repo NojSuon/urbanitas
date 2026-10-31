@@ -602,6 +602,22 @@ pub fn dist(a: P2, b: P2) -> f64 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
 }
 
+/// What makes a group of parts one house: a self-contained module that moves, turns,
+/// recolours and can be saved as a design.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Module {
+    pub name: String,
+    /// The saved design this house is a copy of, if any.
+    #[serde(default)]
+    pub design: Option<String>,
+    /// Quarter turns clockwise from the way the house was designed (facing south).
+    #[serde(default)]
+    pub turns: u8,
+    /// The house's plot, garden included, as placed.
+    #[serde(default)]
+    pub lot: Option<Rect>,
+}
+
 /// A building as a list of parts, plus the style and colours that dress them.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Layout {
@@ -616,6 +632,9 @@ pub struct Layout {
     /// Each building's own colours, indexed by `Part::group`.
     #[serde(default)]
     pub palettes: Vec<Palette>,
+    /// Each house's module details, indexed by `Part::group` like `palettes`.
+    #[serde(default)]
+    pub modules: Vec<Module>,
     /// The ground, if the site has relief.
     #[serde(default)]
     pub terrain: Option<crate::terrain::Terrain>,
@@ -635,6 +654,7 @@ impl Layout {
             parts: Vec::new(),
             next_id: 1,
             palettes: Vec::new(),
+            modules: Vec::new(),
             terrain: None,
             water: None,
         }
@@ -670,7 +690,38 @@ impl Layout {
     /// Registers a new building's palette and returns its group.
     pub fn new_group(&mut self, palette: Palette) -> u32 {
         self.palettes.push(palette);
-        (self.palettes.len() - 1) as u32
+        let group = (self.palettes.len() - 1) as u32;
+        self.module_mut(group).name = format!("House {}", group + 1);
+        group
+    }
+
+    /// Building `group`'s module details (older projects have none until asked).
+    pub fn module(&self, group: u32) -> Option<&Module> {
+        self.modules.get(group as usize)
+    }
+
+    pub fn module_mut(&mut self, group: u32) -> &mut Module {
+        let i = group as usize;
+        if self.modules.len() <= i {
+            let first = self.modules.len();
+            self.modules.extend((first..=i).map(|g| Module {
+                name: format!("House {}", g + 1),
+                ..Module::default()
+            }));
+        }
+        &mut self.modules[i]
+    }
+
+    /// Removes every part of building `group` (its slot stays, so other groups keep their numbers).
+    pub fn remove_group(&mut self, group: u32) {
+        self.parts.retain(|p| p.group != Some(group));
+    }
+
+    /// The ground-plane box around all of building `group`'s parts.
+    pub fn group_bounds(&self, group: u32) -> Option<Rect> {
+        self.group_parts(group)
+            .map(Part::footprint)
+            .reduce(|a, b| a.union(&b))
     }
 
     /// Every part of building `group`.

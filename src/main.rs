@@ -166,7 +166,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                     seed: params.seed,
                     ..TownParams::default()
                 };
-                let report = grow_town(&mut layout, plaza, &town)?;
+                let report = grow_town(&mut layout, plaza, &town, &[])?;
                 println!(
                     "Town: {} houses on {} streets",
                     report.houses, report.streets

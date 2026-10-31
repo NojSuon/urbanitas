@@ -17,14 +17,39 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::design::Design;
 use crate::generate::generate;
 use crate::geometry::Rect;
 use crate::landscape::{Water, WaterKind};
-use crate::layout::append_building;
 use crate::params::{ArchitectureStyle, BuildingParams, BuildingType, Garden, Shape, Size};
 use crate::parts::*;
 use crate::rng::Rng;
 use crate::terrain::{Terrain, smoothstep};
+
+/// Where a town's houses come from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesignMix {
+    /// Every house newly generated.
+    #[default]
+    Generated,
+    /// Only your saved designs (plots none of them fit stay empty).
+    Designs,
+    /// Saved designs and generated houses, half and half.
+    Mixed,
+}
+
+impl DesignMix {
+    pub const ALL: [DesignMix; 3] = [DesignMix::Generated, DesignMix::Designs, DesignMix::Mixed];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DesignMix::Generated => "Generated houses",
+            DesignMix::Designs => "My designs",
+            DesignMix::Mixed => "Mixed",
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -35,6 +60,8 @@ pub struct TownParams {
     /// 0–1: how tightly houses pack and how often streets branch.
     pub density: f64,
     pub seed: u64,
+    /// Where the houses come from.
+    pub mix: DesignMix,
 }
 
 impl Default for TownParams {
@@ -44,6 +71,7 @@ impl Default for TownParams {
             houses: 24,
             density: 0.6,
             seed: 1,
+            mix: DesignMix::Generated,
         }
     }
 }
@@ -152,6 +180,8 @@ fn wet(water: Option<&Water>, t: &Terrain, p: P2, margin: f64) -> bool {
 
 struct Town<'a> {
     layout: &'a mut Layout,
+    /// Saved designs the town may use.
+    designs: &'a [Design],
     params: TownParams,
     rng: Rng,
     plaza: P2,
@@ -168,7 +198,7 @@ struct Town<'a> {
 }
 
 impl<'a> Town<'a> {
-    fn new(layout: &'a mut Layout, plaza: P2, params: &TownParams) -> Self {
+    fn new(layout: &'a mut Layout, plaza: P2, params: &TownParams, designs: &'a [Design]) -> Self {
         if layout.terrain.is_none() {
             layout.terrain = Some(Terrain::flat(
                 Rect::new(plaza[0] - 120.0, plaza[1] - 120.0, 240.0, 240.0),
@@ -195,6 +225,7 @@ impl<'a> Town<'a> {
         taken.extend(groups.into_iter().map(|(_, r)| r));
         Self {
             layout,
+            designs,
             params: *params,
             rng: Rng::new(params.seed ^ 0x70_57),
             plaza,
@@ -578,8 +609,13 @@ impl<'a> Town<'a> {
             };
             let kind = self.kind_at(probe);
             let (params, gap) = self.house_params(kind);
+            let Some((design, link)) = self.choose_design(&params, end - cursor) else {
+                cursor += 3.0;
+                misses += 1;
+                continue;
+            };
             match self.place_house(
-                &params, kind, quarters, axis, side, cursor, seg.width, gap, end,
+                &design, link, kind, quarters, axis, cursor, seg.width, gap, end,
             ) {
                 Some(used) => {
                     cursor += used + gap;
@@ -593,27 +629,49 @@ impl<'a> Town<'a> {
         }
     }
 
+    /// The house for a plot with `room` metres of street left: a saved design that fits
+    /// (as the design mix allows), or a newly generated house. The flag says whether it's a
+    /// saved design, whose copies stay linked to it.
+    fn choose_design(&mut self, params: &BuildingParams, room: f64) -> Option<(Design, bool)> {
+        let saved = match self.params.mix {
+            DesignMix::Generated => false,
+            DesignMix::Designs => true,
+            DesignMix::Mixed => self.rng.chance(0.5),
+        };
+        if saved && !self.designs.is_empty() {
+            let fits: Vec<&Design> = self
+                .designs
+                .iter()
+                .filter(|d| d.lot.w * 0.6 <= room)
+                .collect();
+            if !fits.is_empty() {
+                return Some(((*self.rng.pick(&fits)).clone(), true));
+            }
+            if self.params.mix == DesignMix::Designs {
+                return None;
+            }
+        }
+        generate(params)
+            .ok()
+            .map(|b| (Design::from_building(&b), false))
+    }
+
     /// Places one house at `cursor` along a street, if it fits. Returns its frontage.
     #[allow(clippy::too_many_arguments)]
     fn place_house(
         &mut self,
-        params: &BuildingParams,
+        design: &Design,
+        link: bool,
         kind: HouseKind,
         quarters: usize,
         axis: f64,
-        side: f64,
         cursor: f64,
         street_width: f64,
         gap: f64,
         end: f64,
     ) -> Option<f64> {
-        let b = generate(params).ok()?;
-        let lot = b
-            .garden
-            .as_ref()
-            .map_or(Rect::new(0.0, 0.0, b.footprint.w, b.footprint.d), |g| g.lot);
         // Frontage along the street and depth away from it.
-        let (front, deep) = (lot.w, lot.d);
+        let (front, deep) = (design.lot.w, design.lot.d);
         // A house may overhang the end of its street a little.
         if cursor + front * 0.6 > end {
             return None;
@@ -627,7 +685,6 @@ impl<'a> Town<'a> {
             1 => Rect::new(axis + near, cursor, deep, front),
             _ => Rect::new(axis - near - deep, cursor, deep, front),
         };
-        let _ = side;
         if !self.free(&target.grow(margin)) {
             return None;
         }
@@ -647,17 +704,8 @@ impl<'a> Town<'a> {
             return None;
         }
         let level = (low + high) / 2.0;
-        let group = self.layout.new_group(b.palette.clone());
-        let first = self.layout.parts.len();
-        append_building(self.layout, &b, [0.0, 0.0], level, Some(group));
-        let c = [lot.x + lot.w / 2.0, lot.z + lot.d / 2.0];
         let goal = target.center();
-        for part in &mut self.layout.parts[first..] {
-            for _ in 0..quarters {
-                part.rotate_quarter_about(c);
-            }
-            part.translate([goal.0 - c[0], goal.1 - c[1]]);
-        }
+        let group = design.place(self.layout, [goal.0, goal.1], quarters as u8, level, link);
         // A stone plinth under the whole lot, just below its garden: where the ground
         // falls away it shows as a terrace wall.
         self.layout.add_in(
@@ -822,13 +870,15 @@ pub fn suggest_piazza(layout: &Layout) -> Option<P2> {
     best.map(|(p, _)| p)
 }
 
-/// Grows a town around a piazza at `plaza` on the layout's landscape.
+/// Grows a town around a piazza at `plaza` on the layout's landscape, using `designs` as
+/// the design mix allows.
 pub fn grow_town(
     layout: &mut Layout,
     plaza: P2,
     params: &TownParams,
+    designs: &[Design],
 ) -> Result<TownReport, TownError> {
-    let mut town = Town::new(layout, plaza, params);
+    let mut town = Town::new(layout, plaza, params, designs);
     let piazza = town.piazza()?;
     town.grow_streets(piazza);
     Ok(town.finish())
@@ -836,7 +886,13 @@ pub fn grow_town(
 
 /// Lays a street from `a` towards `b` (straightened onto the nearer axis) and lines it with
 /// houses. Returns how many houses were built.
-pub fn fill_street(layout: &mut Layout, a: P2, b: P2, params: &TownParams) -> TownReport {
+pub fn fill_street(
+    layout: &mut Layout,
+    a: P2,
+    b: P2,
+    params: &TownParams,
+    designs: &[Design],
+) -> TownReport {
     let b = if (b[0] - a[0]).abs() >= (b[1] - a[1]).abs() {
         [b[0], a[1]]
     } else {
@@ -853,7 +909,7 @@ pub fn fill_street(layout: &mut Layout, a: P2, b: P2, params: &TownParams) -> To
             _ => None,
         })
         .unwrap_or([(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0]);
-    let mut town = Town::new(layout, plaza, params);
+    let mut town = Town::new(layout, plaza, params, designs);
     let seg = Segment { a, b, width: 5.0 };
     town.lay_street(seg);
     town.line_streets(0);
@@ -919,6 +975,7 @@ mod tests {
                         houses: 20,
                         ..TownParams::default()
                     },
+                    &[],
                 )
                 .unwrap_or_else(|e| panic!("{relief:?} {water:?}: {e}"));
                 assert!(
@@ -1007,6 +1064,7 @@ mod tests {
                     seed,
                     ..TownParams::default()
                 },
+                &[],
             )
             .unwrap();
             layout
@@ -1038,6 +1096,7 @@ mod tests {
                     seed,
                     ..TownParams::default()
                 },
+                &[],
             );
             for x in (-60..=60).step_by(10) {
                 let p = [x as f64, plaza[1] - 10.0];
@@ -1055,6 +1114,7 @@ mod tests {
                     seed,
                     ..TownParams::default()
                 },
+                &[],
             )
             .unwrap();
         }
@@ -1063,12 +1123,68 @@ mod tests {
     }
 
     #[test]
+    fn towns_arrange_saved_designs() {
+        let b = generate(&BuildingParams {
+            garden: Garden::Back,
+            seed: 4,
+            ..BuildingParams::default()
+        })
+        .unwrap();
+        let mut d = Design::from_building(&b);
+        d.id = "casa".into();
+        d.name = "Casa".into();
+        let mut layout = landscape(Relief::Flat, WaterBody::None);
+        let plaza = dry_spot(&layout);
+        let params = TownParams {
+            houses: 12,
+            mix: DesignMix::Designs,
+            ..TownParams::default()
+        };
+        let report = grow_town(&mut layout, plaza, &params, std::slice::from_ref(&d)).unwrap();
+        assert!(report.houses >= 6, "{report:?}");
+        let copies = layout
+            .modules
+            .iter()
+            .filter(|m| m.design.as_deref() == Some("casa"))
+            .count();
+        assert_eq!(copies, report.houses, "every house is a copy of the design");
+        // Each copy, saved again, is the design (turned to face its street).
+        for g in 0..layout.modules.len() as u32 {
+            if layout.module(g).is_some_and(|m| m.is_copy()) {
+                let again = Design::capture(&layout, g, "casa", "Casa").unwrap();
+                assert_eq!(
+                    again.parts.len(),
+                    d.parts.len(),
+                    "the design (its plinth stays with the site)"
+                );
+                assert!(
+                    (again.lot.w - d.lot.w).abs() < 1e-6 && (again.lot.d - d.lot.d).abs() < 1e-6
+                );
+            }
+        }
+        // Mixed towns use both.
+        let mut layout = landscape(Relief::Flat, WaterBody::None);
+        let params = TownParams {
+            houses: 24,
+            mix: DesignMix::Mixed,
+            ..TownParams::default()
+        };
+        grow_town(&mut layout, plaza, &params, std::slice::from_ref(&d)).unwrap();
+        let copies = layout.modules.iter().filter(|m| m.is_copy()).count();
+        assert!(
+            copies > 0 && copies < layout.modules.len(),
+            "{copies} of {}",
+            layout.modules.len()
+        );
+    }
+
+    #[test]
     fn piazzas_refuse_water() {
         let mut layout = landscape(Relief::Flat, WaterBody::Beach);
         let t = layout.terrain.as_ref().unwrap();
         let sea = [0.0, t.rect.z + 40.0];
         assert_eq!(
-            grow_town(&mut layout, sea, &TownParams::default()),
+            grow_town(&mut layout, sea, &TownParams::default(), &[]),
             Err(TownError::InWater)
         );
     }
@@ -1081,6 +1197,7 @@ mod tests {
             [-60.0, 20.0],
             [60.0, 24.0],
             &TownParams::default(),
+            &[],
         );
         assert_eq!(report.streets, 1);
         assert!(report.houses >= 6, "{report:?}");
