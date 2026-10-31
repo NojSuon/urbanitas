@@ -1356,21 +1356,26 @@ impl<'a> Scene<'a> {
             let p = t.point(i, j);
             v3(p[0], t.get(i, j), p[1])
         };
+        let ground = crate::landscape::ground_map(t, self.layout.water.as_ref());
         for j in 0..t.rows {
             for i in 0..t.cols {
                 let quad = [at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1)];
+                let material = ground[j * (t.cols + 1) + i].material();
                 for tri in [[quad[0], quad[1], quad[2]], [quad[0], quad[2], quad[3]]] {
-                    let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalized();
-                    let material = if n.y.abs() < 0.8 {
-                        Material::Earth
-                    } else {
-                        Material::Lawn
-                    };
                     set.polygon(material, &tri, V3::UP);
                 }
             }
         }
         set
+    }
+
+    /// The sea, lake or river surface.
+    pub fn build_water(&self) -> MeshSet {
+        self.layout
+            .water
+            .as_ref()
+            .map(|w| w.mesh())
+            .unwrap_or_default()
     }
 
     /// Every building group on `level`, meshed separately so each can wear its own colours.

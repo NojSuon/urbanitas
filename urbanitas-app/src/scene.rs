@@ -10,6 +10,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, PrimitiveTopology, TextureDimension, TextureFormat};
 use bevy::render::view::Msaa;
 use bevy_panorbit_camera::PanOrbitCamera;
+use urbanitas::landscape::{Water, ground_map};
 use urbanitas::mesh::build::{Scene, View, WallMode};
 use urbanitas::mesh::{Material, MeshData, MeshSet};
 use urbanitas::style::Palette;
@@ -59,6 +60,13 @@ pub struct LevelMesh {
 #[derive(Component)]
 pub struct TerrainMesh;
 
+/// The sea, lake or river surface.
+#[derive(Component)]
+pub struct WaterMesh;
+
+/// The terrain and water meshes, rebuilt together.
+type GroundMeshes = Or<(With<TerrainMesh>, With<WaterMesh>)>;
+
 #[derive(Component)]
 pub struct Sun;
 
@@ -86,6 +94,7 @@ impl SceneStats {
 pub struct MaterialCache {
     materials: HashMap<(Material, String, u32), Handle<StandardMaterial>>,
     terrain: Option<(u32, Handle<StandardMaterial>)>,
+    water: Option<(u32, Handle<StandardMaterial>)>,
 }
 
 impl MaterialCache {
@@ -128,7 +137,7 @@ impl MaterialCache {
             .clone()
     }
 
-    /// Grass whose colour is multiplied by the terrain's vertex colours.
+    /// A neutral grain whose colour comes from the terrain's vertex colours (grass, sand, rock).
     fn terrain(
         &mut self,
         palette: &Palette,
@@ -142,7 +151,7 @@ impl MaterialCache {
                 return handle.clone();
             }
         }
-        let tex = texture::generate(Material::Lawn, palette, size);
+        let tex = neutral(&texture::generate(Material::Lawn, palette, size));
         let image = images.add(make_image(&tex, quality));
         let handle = materials.add(StandardMaterial {
             base_color_texture: Some(image),
@@ -152,6 +161,57 @@ impl MaterialCache {
         });
         self.terrain = Some((size, handle.clone()));
         handle
+    }
+
+    /// See-through, glossy water.
+    fn water(
+        &mut self,
+        palette: &Palette,
+        quality: Quality,
+        images: &mut Assets<Image>,
+        materials: &mut Assets<StandardMaterial>,
+    ) -> Handle<StandardMaterial> {
+        let size = quality.texture_size();
+        if let Some((s, handle)) = &self.water {
+            if *s == size {
+                return handle.clone();
+            }
+        }
+        let tex = texture::generate(Material::Water, palette, size);
+        let image = images.add(make_image(&tex, quality));
+        let handle = materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 1.0, 1.0, 0.8),
+            base_color_texture: Some(image),
+            alpha_mode: AlphaMode::Blend,
+            perceptual_roughness: 0.06,
+            reflectance: 0.6,
+            ..default()
+        });
+        self.water = Some((size, handle.clone()));
+        handle
+    }
+}
+
+/// The texture's grain in grey, brightened to about white, so vertex colours set the hue.
+fn neutral(tex: &texture::Texture) -> texture::Texture {
+    let levels = tex
+        .levels
+        .iter()
+        .map(|level| {
+            let lum = |p: &[u8]| 0.3 * p[0] as f32 + 0.59 * p[1] as f32 + 0.11 * p[2] as f32;
+            let mean = level.chunks(4).map(lum).sum::<f32>() / (level.len() / 4).max(1) as f32;
+            level
+                .chunks(4)
+                .flat_map(|p| {
+                    let v = (lum(p) / mean.max(1.0) * 235.0).clamp(0.0, 255.0) as u8;
+                    [v, v, v, 255]
+                })
+                .collect()
+        })
+        .collect();
+    texture::Texture {
+        size: tex.size,
+        levels,
     }
 }
 
@@ -203,8 +263,9 @@ pub fn merged(set: &MeshSet) -> MeshData {
     out
 }
 
-/// A smooth grid over the height map, every `stride` points, tinted towards bare earth where steep.
-pub fn terrain_mesh(t: &Terrain, stride: usize) -> (Mesh, usize) {
+/// A smooth grid over the height map, every `stride` points, coloured by the kind of ground.
+pub fn terrain_mesh(t: &Terrain, water: Option<&Water>, stride: usize) -> (Mesh, usize) {
+    let ground = ground_map(t, water);
     let stride = stride.max(1);
     let xs: Vec<usize> = (0..=t.cols)
         .step_by(stride)
@@ -231,14 +292,9 @@ pub fn terrain_mesh(t: &Terrain, stride: usize) -> (Mesh, usize) {
             positions.push([p[0] as f32, y as f32, p[1] as f32]);
             normals.push(n.to_array());
             uvs.push([p[0] as f32 / 2.0, -(p[1] as f32) / 2.0]);
-            // Steeper ground shows dry earth through the grass.
-            let steep = ((1.0 - n.y) * 4.0).clamp(0.0, 1.0);
-            colors.push([
-                1.0 - 0.0 * steep,
-                1.0 - 0.18 * steep,
-                1.0 - 0.45 * steep,
-                1.0,
-            ]);
+            let [r, g, b] = ground[j * (t.cols + 1) + i].colour();
+            let c = Color::srgb(r, g, b).to_linear();
+            colors.push([c.red, c.green, c.blue, 1.0]);
         }
     }
     let mut indices = Vec::with_capacity((nx - 1) * (nz - 1) * 6);
@@ -443,7 +499,7 @@ fn rebuild_terrain(
     mut meshes: ResMut<Assets<Mesh>>,
     mut images: ResMut<Assets<Image>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    existing: Query<Entity, With<TerrainMesh>>,
+    existing: Query<Entity, GroundMeshes>,
     mut stats: ResMut<SceneStats>,
 ) {
     if !project.take_terrain_dirty() {
@@ -453,12 +509,27 @@ fn rebuild_terrain(
         commands.entity(entity).despawn();
     }
     stats.terrain = 0;
+    let palette = project.layout.palette.clone();
+    if let Some(water) = &project.layout.water {
+        if let Some(data) = water.mesh().meshes.get(&Material::Water) {
+            let handle = cache.water(&palette, project.quality, &mut images, &mut materials);
+            commands.spawn((
+                WaterMesh,
+                Mesh3d(meshes.add(bevy_mesh(data))),
+                MeshMaterial3d(handle),
+                Transform::default(),
+            ));
+        }
+    }
     let Some(terrain) = &project.layout.terrain else {
         return;
     };
-    let (mesh, triangles) = terrain_mesh(terrain, project.quality.terrain_stride());
+    let (mesh, triangles) = terrain_mesh(
+        terrain,
+        project.layout.water.as_ref(),
+        project.quality.terrain_stride(),
+    );
     stats.terrain = triangles;
-    let palette = project.layout.palette.clone();
     let handle = cache.terrain(&palette, project.quality, &mut images, &mut materials);
     commands.spawn((
         TerrainMesh,

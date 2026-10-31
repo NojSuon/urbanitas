@@ -319,6 +319,30 @@ fn texel(material: Material, palette: &Palette, u: f64, v: f64, speck: f64, seed
             let rut = ((u * 2.0 * PI).sin().abs()).powi(8) * 0.12;
             shade(base, 0.86 + 0.18 * dust - rut + speck * 0.08)
         }
+        Material::Sand => {
+            // Fine pale sand with wind ripples.
+            let ripple = ((v * 9.0 + fbm(u, v, 3, 2, seed) * 3.0) * 2.0 * PI).sin() * 0.04;
+            shade(
+                [0.9, 0.82, 0.64],
+                0.9 + 0.1 * fbm(u, v, 6, 4, seed) + ripple + speck * 0.07,
+            )
+        }
+        Material::Rock => {
+            // Layered limestone: strata, cracks and lichen-dark patches.
+            let f = fbm(u, v, 4, 5, seed);
+            let strata = ((v * 7.0 + f * 2.5) * 2.0 * PI).sin() * 0.07;
+            let crack = if ((v * 7.0 + f * 2.5).fract() - 0.5).abs() < 0.03 {
+                0.7
+            } else {
+                1.0
+            };
+            let c = mix(
+                [0.66, 0.62, 0.55],
+                [0.5, 0.49, 0.45],
+                fbm(u, v, 2, 3, seed + 7),
+            );
+            shade(c, (0.88 + 0.16 * f + strata + speck * 0.08) * crack)
+        }
         Material::Basalt => {
             // Dark cobbles in staggered rows, with pale joints.
             let rows = 8.0;

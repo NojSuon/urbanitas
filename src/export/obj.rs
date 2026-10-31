@@ -94,6 +94,7 @@ pub fn to_obj(layout: &Layout, mtl_name: &str, texture_prefix: &str) -> ObjExpor
         }
     };
     write_set("terrain", None, scene.build_terrain(), &mut obj, &mut body);
+    write_set("water", None, scene.build_water(), &mut obj, &mut body);
     for part in &layout.parts {
         write_set(
             &group_name(part),

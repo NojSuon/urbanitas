@@ -18,6 +18,9 @@ pub struct Terrain {
     pub rows: usize,
     /// Row-major heights, `(cols + 1) * (rows + 1)` of them.
     pub heights: Vec<f32>,
+    /// Painted sand, 0–255 per grid point (empty until something is painted).
+    #[serde(default)]
+    pub sand: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -28,6 +31,8 @@ pub enum Brush {
     Flatten(f64),
     /// Average with the neighbours.
     Smooth,
+    /// Paint sand onto the ground (heights unchanged).
+    Sand,
 }
 
 fn hash(x: i64, y: i64, seed: u64) -> f64 {
@@ -40,7 +45,7 @@ fn hash(x: i64, y: i64, seed: u64) -> f64 {
     (h >> 11) as f64 / (1u64 << 53) as f64
 }
 
-fn smooth_noise(x: f64, y: f64, seed: u64) -> f64 {
+pub(crate) fn smooth_noise(x: f64, y: f64, seed: u64) -> f64 {
     let (x0, y0) = (x.floor(), y.floor());
     let (fx, fy) = (x - x0, y - y0);
     let (sx, sy) = (fx * fx * (3.0 - 2.0 * fx), fy * fy * (3.0 - 2.0 * fy));
@@ -51,7 +56,7 @@ fn smooth_noise(x: f64, y: f64, seed: u64) -> f64 {
 }
 
 /// Rolling hills in `[-1, 1]`, with features about `scale` metres across.
-fn hills(x: f64, z: f64, scale: f64, seed: u64) -> f64 {
+pub(crate) fn hills(x: f64, z: f64, scale: f64, seed: u64) -> f64 {
     let (mut sum, mut amp, mut norm, mut freq) = (0.0, 1.0, 0.0, 1.0 / scale);
     for octave in 0..4 {
         sum += smooth_noise(x * freq, z * freq, seed + octave) * amp;
@@ -62,7 +67,7 @@ fn hills(x: f64, z: f64, scale: f64, seed: u64) -> f64 {
     (sum / norm - 0.5) * 2.0
 }
 
-fn smoothstep(t: f64) -> f64 {
+pub(crate) fn smoothstep(t: f64) -> f64 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
@@ -77,6 +82,7 @@ impl Terrain {
             cols,
             rows,
             heights: vec![0.0; (cols + 1) * (rows + 1)],
+            sand: Vec::new(),
         }
     }
 
@@ -110,7 +116,7 @@ impl Terrain {
         self.heights[j * (self.cols + 1) + i] as f64
     }
 
-    fn set(&mut self, i: usize, j: usize, h: f64) {
+    pub(crate) fn set(&mut self, i: usize, j: usize, h: f64) {
         let cols = self.cols;
         self.heights[j * (cols + 1) + i] = h as f32;
     }
@@ -167,20 +173,56 @@ impl Terrain {
         }
     }
 
+    /// How much sand is painted at grid point `(i, j)`, in `[0, 1]`.
+    pub fn sand_at(&self, i: usize, j: usize) -> f64 {
+        self.sand
+            .get(j * (self.cols + 1) + i)
+            .map_or(0.0, |&v| v as f64 / 255.0)
+    }
+
     /// Applies a brush stroke; returns whether anything changed. `strength` is metres per stroke.
     pub fn brush(&mut self, brush: Brush, centre: P2, radius: f64, strength: f64) -> bool {
-        let mut changed = false;
-        let before = self.heights.clone();
+        self.brush_masked(brush, centre, radius, strength, &|_| 1.0)
+    }
+
+    /// A brush stroke whose effect is scaled by `mask` (0 leaves a point alone, 1 is full effect),
+    /// so building pads can be protected. Only grid points inside the radius are visited.
+    pub fn brush_masked(
+        &mut self,
+        brush: Brush,
+        centre: P2,
+        radius: f64,
+        strength: f64,
+        mask: &dyn Fn(P2) -> f64,
+    ) -> bool {
+        let (sx, sz) = self.spacing();
+        let lo_i =
+            (((centre[0] - radius - self.rect.x) / sx).floor().max(0.0) as usize).min(self.cols);
+        let hi_i =
+            (((centre[0] + radius - self.rect.x) / sx).ceil().max(0.0) as usize).min(self.cols);
+        let lo_j =
+            (((centre[1] - radius - self.rect.z) / sz).floor().max(0.0) as usize).min(self.rows);
+        let hi_j =
+            (((centre[1] + radius - self.rect.z) / sz).ceil().max(0.0) as usize).min(self.rows);
+        if brush == Brush::Sand && self.sand.len() != self.heights.len() {
+            self.sand = vec![0; self.heights.len()];
+        }
         let cols = self.cols;
+        let rows = self.rows;
+        let before: Vec<f32> = self.heights.clone();
         let at = |i: usize, j: usize| before[j * (cols + 1) + i] as f64;
-        for j in 0..=self.rows {
-            for i in 0..=self.cols {
+        let mut changed = false;
+        for j in lo_j..=hi_j {
+            for i in lo_i..=hi_i {
                 let p = self.point(i, j);
                 let d = ((p[0] - centre[0]).powi(2) + (p[1] - centre[1]).powi(2)).sqrt();
                 if d >= radius {
                     continue;
                 }
-                let k = 1.0 - smoothstep(d / radius);
+                let k = (1.0 - smoothstep(d / radius)) * mask(p).clamp(0.0, 1.0);
+                if k <= 0.0 {
+                    continue;
+                }
                 let h = at(i, j);
                 let target = match brush {
                     Brush::Raise => h + strength * k,
@@ -191,22 +233,26 @@ impl Terrain {
                         let mut n = 0.0;
                         for (di, dj) in [(-1i64, 0i64), (1, 0), (0, -1), (0, 1)] {
                             let (ni, nj) = (i as i64 + di, j as i64 + dj);
-                            if ni >= 0
-                                && nj >= 0
-                                && ni as usize <= self.cols
-                                && nj as usize <= self.rows
-                            {
+                            if ni >= 0 && nj >= 0 && ni as usize <= cols && nj as usize <= rows {
                                 sum += at(ni as usize, nj as usize);
                                 n += 1.0;
                             }
                         }
                         h + (sum / n - h) * (k * strength).min(1.0)
                     }
+                    Brush::Sand => {
+                        let index = j * (cols + 1) + i;
+                        let old = self.sand[index];
+                        let new = (old as f64 + 255.0 * k * strength.min(1.0)).min(255.0) as u8;
+                        changed |= new != old;
+                        self.sand[index] = new;
+                        h
+                    }
                 };
                 if (target - h).abs() > 1e-6 {
                     changed = true;
+                    self.set(i, j, target);
                 }
-                self.set(i, j, target);
             }
         }
         changed
@@ -236,6 +282,26 @@ mod tests {
         t.flatten_pad(&pad, 2.5, 4.0);
         let (lo, hi) = t.range_in(&pad);
         assert!((lo - 2.5).abs() < 1e-3 && (hi - 2.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn masked_brushes_leave_pads_alone() {
+        let rect = Rect::new(0.0, 0.0, 40.0, 40.0);
+        let mut t = Terrain::flat(rect, 1.0);
+        let pad = Rect::new(18.0, 18.0, 4.0, 4.0);
+        let mask = |p: P2| {
+            if p[0] >= pad.x && p[0] <= pad.x1() && p[1] >= pad.z && p[1] <= pad.z1() {
+                0.0
+            } else {
+                1.0
+            }
+        };
+        assert!(t.brush_masked(Brush::Raise, [20.0, 20.0], 8.0, 2.0, &mask));
+        assert_eq!(t.height_at([20.0, 20.0]), 0.0, "the pad is untouched");
+        assert!(t.height_at([25.0, 20.0]) > 0.1, "the ground around it rose");
+        assert!(t.brush(Brush::Sand, [5.0, 5.0], 3.0, 1.0));
+        assert!(t.sand_at(5, 5) > 0.9);
+        assert_eq!(t.height_at([5.0, 5.0]), 0.0, "sand doesn't move the ground");
     }
 
     #[test]

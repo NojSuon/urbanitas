@@ -123,10 +123,14 @@ pub enum Material {
     Slabs,
     /// Rough dry-stone walling.
     Rubble,
+    /// Beach sand.
+    Sand,
+    /// Bare rock: cliffs and steep mountainsides.
+    Rock,
 }
 
 impl Material {
-    pub const ALL: [Material; 23] = [
+    pub const ALL: [Material; 25] = [
         Material::Plaster,
         Material::InteriorPlaster,
         Material::Rustication,
@@ -150,6 +154,8 @@ impl Material {
         Material::Basalt,
         Material::Slabs,
         Material::Rubble,
+        Material::Sand,
+        Material::Rock,
     ];
 
     pub fn name(self) -> &'static str {
@@ -177,6 +183,8 @@ impl Material {
             Material::Basalt => "basalt",
             Material::Slabs => "slabs",
             Material::Rubble => "rubble",
+            Material::Sand => "sand",
+            Material::Rock => "rock",
         }
     }
 
@@ -209,6 +217,8 @@ impl Material {
             Material::Earth | Material::Slabs => 3.0,
             Material::Basalt => 1.2,
             Material::Rubble => 2.0,
+            Material::Sand => 2.5,
+            Material::Rock => 4.0,
             _ => 1.0,
         }
     }

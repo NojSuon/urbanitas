@@ -51,6 +51,21 @@ impl Rect {
         )
     }
 
+    /// The smallest rectangle covering both.
+    pub fn union(&self, other: &Rect) -> Rect {
+        let (x0, z0) = (self.x.min(other.x), self.z.min(other.z));
+        let (x1, z1) = (self.x1().max(other.x1()), self.z1().max(other.z1()));
+        Rect::new(x0, z0, x1 - x0, z1 - z0)
+    }
+
+    /// True when the point lies inside or on the edge.
+    pub fn contains_point(&self, p: [f64; 2]) -> bool {
+        p[0] >= self.x - EPS
+            && p[0] <= self.x1() + EPS
+            && p[1] >= self.z - EPS
+            && p[1] <= self.z1() + EPS
+    }
+
     pub fn grow(&self, margin: f64) -> Rect {
         self.expand(margin, margin, margin, margin)
     }

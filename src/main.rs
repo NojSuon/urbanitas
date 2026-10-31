@@ -9,8 +9,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Parser, ValueEnum};
 use urbanitas::export::{json, obj, svg};
 use urbanitas::{
-    ArchitectureStyle, Building, BuildingParams, BuildingType, Context, Garden, Shape, SiteParams,
-    Size, generate, generate_site,
+    ArchitectureStyle, Building, BuildingParams, BuildingType, Context, Garden, LandscapeParams,
+    Relief, Shape, SiteParams, Size, TownParams, WaterBody, generate, generate_site, grow_town,
+    landscape_layout, suggest_piazza,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -60,6 +61,18 @@ struct Cli {
     /// Height of the hills, in metres (0 for flat ground).
     #[arg(long, default_value_t = 0.0)]
     relief: f64,
+    /// Generate a whole landscape with this relief and grow a town on it (instead of --context).
+    #[arg(long, value_enum)]
+    landscape: Option<Relief>,
+    /// The landscape's body of water.
+    #[arg(long, value_enum, default_value_t = WaterBody::Beach)]
+    water: WaterBody,
+    /// Side of the landscape's square map, in metres.
+    #[arg(long, default_value_t = 320.0)]
+    map_size: f64,
+    /// How many houses the town on a landscape gets (0 for bare land).
+    #[arg(long, default_value_t = 24)]
+    town: u32,
     /// Random seed; the same seed and parameters always give the same building. Random if omitted.
     #[arg(long)]
     seed: Option<u64>,
@@ -128,12 +141,41 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         .as_deref()
         .map(sanitize)
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| match cli.context {
-            Context::Single => building.name.clone(),
-            _ => format!("urbanitas_{}_{}", site_slug(cli.context), params.seed),
+        .unwrap_or_else(|| match (cli.landscape, cli.context) {
+            (Some(relief), _) => {
+                format!("urbanitas_town_{relief:?}_{:?}_{}", cli.water, params.seed).to_lowercase()
+            }
+            (None, Context::Single) => building.name.clone(),
+            (None, context) => format!("urbanitas_{}_{}", site_slug(context), params.seed),
         });
 
-    let layout = generate_site(&site)?;
+    let layout = match cli.landscape {
+        Some(relief) => {
+            let land = LandscapeParams {
+                relief,
+                water: cli.water,
+                size: cli.map_size,
+                seed: params.seed,
+            };
+            let mut layout = landscape_layout(&land, params.style);
+            if cli.town > 0 {
+                let plaza = suggest_piazza(&layout).ok_or("no dry ground for a town")?;
+                let town = TownParams {
+                    style: params.style,
+                    houses: cli.town,
+                    seed: params.seed,
+                    ..TownParams::default()
+                };
+                let report = grow_town(&mut layout, plaza, &town)?;
+                println!(
+                    "Town: {} houses on {} streets",
+                    report.houses, report.streets
+                );
+            }
+            layout
+        }
+        None => generate_site(&site)?,
+    };
 
     fs::create_dir_all(&cli.out)?;
     let mut written = Vec::new();
@@ -154,7 +196,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         written.push(path);
     }
 
-    if cli.context == Context::Single {
+    if cli.landscape.is_none() && cli.context == Context::Single {
         print_summary(&building);
     } else {
         println!("Urbanitas · {}", layout.description);

@@ -18,7 +18,7 @@ pub type PartId = u64;
 pub type P2 = [f64; 2];
 
 /// Bumped when the project file format changes incompatibly.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Part {
@@ -543,27 +543,53 @@ impl Part {
     /// Rotates the part about its own centre by a quarter turn clockwise (seen from above).
     pub fn rotate_quarter(&mut self) {
         let c = self.footprint().center();
+        self.rotate_quarter_about([c.0, c.1]);
+    }
+
+    /// Rotates the part about `centre` by a quarter turn clockwise (seen from above), so a
+    /// whole building can turn as one: a house facing south ends up facing west.
+    pub fn rotate_quarter_about(&mut self, centre: P2) {
         let turn = |p: &mut P2| {
-            let (dx, dz) = (p[0] - c.0, p[1] - c.1);
-            *p = [c.0 + dz, c.1 - dx];
+            let (dx, dz) = (p[0] - centre[0], p[1] - centre[1]);
+            *p = [centre[0] + dz, centre[1] - dx];
         };
         let turn_dir = |v: &mut P2| *v = [v[1], -v[0]];
-        let turn_rect = |r: &mut Rect| *r = Rect::new(c.0 - r.d / 2.0, c.1 - r.w / 2.0, r.d, r.w);
+        let turn_rect = |r: &mut Rect| {
+            *r = Rect::new(
+                centre[0] + r.z - centre[1],
+                centre[1] - r.x1() + centre[0],
+                r.d,
+                r.w,
+            )
+        };
         match &mut self.kind {
             PartKind::Wall(w) => {
                 turn(&mut w.a);
                 turn(&mut w.b);
             }
-            PartKind::Opening(o) => turn_dir(&mut o.facing),
-            PartKind::Balcony(b) => turn_dir(&mut b.facing),
+            PartKind::Opening(o) => {
+                turn(&mut o.at);
+                turn_dir(&mut o.facing);
+            }
+            PartKind::Balcony(b) => {
+                turn(&mut b.at);
+                turn_dir(&mut b.facing);
+            }
             PartKind::Floor(f) => turn_rect(&mut f.rect),
             PartKind::Stairs(s) => {
                 turn_rect(&mut s.rect);
                 s.heading = s.heading.turned_right();
             }
-            PartKind::Roof(r) => turn_rect(&mut r.rect),
+            PartKind::Roof(r) => {
+                turn_rect(&mut r.rect);
+                // (south, north, west, east): south turns to west, west to north, and so on.
+                r.open = [r.open[3], r.open[2], r.open[0], r.open[1]];
+            }
             PartKind::Area(a) => turn_rect(&mut a.rect),
-            PartKind::Prop(p) => p.yaw -= std::f64::consts::FRAC_PI_2,
+            PartKind::Prop(p) => {
+                turn(&mut p.at);
+                p.yaw -= std::f64::consts::FRAC_PI_2;
+            }
         }
     }
 }
@@ -593,6 +619,9 @@ pub struct Layout {
     /// The ground, if the site has relief.
     #[serde(default)]
     pub terrain: Option<crate::terrain::Terrain>,
+    /// A sea, lake or river lying on the terrain.
+    #[serde(default)]
+    pub water: Option<crate::landscape::Water>,
 }
 
 impl Layout {
@@ -607,6 +636,7 @@ impl Layout {
             next_id: 1,
             palettes: Vec::new(),
             terrain: None,
+            water: None,
         }
     }
 
