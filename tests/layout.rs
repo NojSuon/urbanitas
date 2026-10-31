@@ -70,6 +70,8 @@ fn every_part_kind_builds_a_valid_mesh() {
         height: 3.6,
         thickness: 0.45,
         exterior: true,
+        base: 0.0,
+        finish: WallFinish::Building,
     };
     let mut kinds = vec![
         PartKind::Wall(wall),
@@ -92,6 +94,11 @@ fn every_part_kind_builds_a_valid_mesh() {
     for roof in [
         Roof::Flat {
             parapet_height: 0.9,
+            balustrade: false,
+        },
+        Roof::Flat {
+            parapet_height: 1.0,
+            balustrade: true,
         },
         Roof::Hip {
             pitch_deg: 18.0,
@@ -102,6 +109,7 @@ fn every_part_kind_builds_a_valid_mesh() {
         kinds.push(PartKind::Roof(RoofPart {
             rect: Rect::new(0.0, 0.0, 10.0, 8.0),
             roof,
+            open: [false, true, false, false],
         }));
     }
     for kind in [
@@ -109,6 +117,7 @@ fn every_part_kind_builds_a_valid_mesh() {
         OpeningKind::Door,
         OpeningKind::BalconyDoor,
         OpeningKind::Storefront,
+        OpeningKind::Gate,
     ] {
         kinds.push(PartKind::Opening(OpeningPart {
             kind,
@@ -134,6 +143,17 @@ fn every_part_kind_builds_a_valid_mesh() {
             yaw: 0.3,
             scale: 1.0,
             height: kind.default_height(),
+        }));
+    }
+    for finish in [WallFinish::Garden, WallFinish::DryStone, WallFinish::Fence] {
+        kinds.push(PartKind::Wall(Wall {
+            a: [0.0, 0.0],
+            b: [8.0, 0.0],
+            height: finish.default_height(),
+            thickness: finish.default_thickness(),
+            exterior: false,
+            base: 0.0,
+            finish,
         }));
     }
     for kind in kinds {
@@ -191,7 +211,8 @@ fn layout_keeps_every_room_opening_and_tree() {
         .count();
     let stair_wells_above_ground = building.floors.len() - 1;
     let rooms: usize = building.floors.iter().map(|f| f.rooms.len()).sum();
-    assert_eq!(floors_in_layout, rooms - stair_wells_above_ground);
+    // Rooms along the facades are split round the walls, so there can be more slabs than rooms.
+    assert!(floors_in_layout >= rooms - stair_wells_above_ground);
 
     let openings: usize = building.floors.iter().map(|f| f.openings.len()).sum();
     let doors: usize = building
@@ -250,6 +271,8 @@ fn a_window_cuts_a_hole_in_its_wall() {
         height: 3.6,
         thickness: 0.45,
         exterior: true,
+        base: 0.0,
+        finish: WallFinish::Building,
     };
     let mut layout = layout_with(PartKind::Wall(wall));
     let solid = Scene::new(&layout)
@@ -339,7 +362,7 @@ fn obj_export_has_normals_uvs_and_textures() {
         Material::Shutter,
     ] {
         assert!(
-            export.materials.contains(&material),
+            export.skins.iter().any(|s| s.material == material),
             "Florentine villa uses {material:?}"
         );
         assert!(
@@ -393,6 +416,86 @@ fn svg_plan_per_level_from_layout() {
                 room.kind.label(),
                 floor.name()
             );
+        }
+    }
+}
+
+#[test]
+fn walls_meet_in_l_and_courtyard_plans() {
+    for shape in [
+        urbanitas::Shape::L,
+        urbanitas::Shape::Courtyard,
+        urbanitas::Shape::U,
+    ] {
+        let p = BuildingParams {
+            size: urbanitas::Size {
+                width: 22.0,
+                depth: 20.0,
+            },
+            rooms: 6,
+            shape,
+            ..florentine_villa(4)
+        };
+        let layout = generate(&p).unwrap().to_layout();
+        let scene = Scene::new(&layout);
+        assert_valid_mesh(&scene.build_all(&View::default()), &format!("{shape:?}"));
+        // Facade wall ends always land on another facade wall (corners close).
+        for part in &layout.parts {
+            let PartKind::Wall(w) = &part.kind else {
+                continue;
+            };
+            if !w.exterior {
+                continue;
+            }
+            for end in [w.a, w.b] {
+                let joined = layout.parts.iter().any(|o| {
+                    o.id != part.id
+                        && o.level == part.level
+                        && matches!(&o.kind, PartKind::Wall(x) if x.exterior && (dist(x.a, end) < 1e-6 || dist(x.b, end) < 1e-6))
+                });
+                assert!(
+                    joined,
+                    "{shape:?}: facade end {end:?} on level {} meets nothing",
+                    part.level
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn terrain_and_sites_mesh_cleanly() {
+    for context in [
+        urbanitas::Context::Urban,
+        urbanitas::Context::Suburban,
+        urbanitas::Context::Rural,
+    ] {
+        for style in ArchitectureStyle::ALL {
+            let p = urbanitas::SiteParams {
+                context,
+                building: BuildingParams {
+                    style,
+                    seed: 3,
+                    ..BuildingParams::default()
+                },
+                buildings: 4,
+                relief: 3.0,
+            };
+            let layout = urbanitas::generate_site(&p).unwrap();
+            let scene = Scene::new(&layout);
+            let terrain = scene.build_terrain();
+            assert_valid_mesh(&terrain, &format!("{context:?} terrain"));
+            assert_valid_mesh(
+                &scene.build_all(&View::default()),
+                &format!("{context:?} {style:?}"),
+            );
+            for level in 0..=layout.parts.iter().map(|p| p.level).max().unwrap() {
+                for (_, set) in scene.build_level_groups(level, &View::default()) {
+                    for mesh in set.meshes.values() {
+                        assert_eq!(mesh.indices.len() % 3, 0);
+                    }
+                }
+            }
         }
     }
 }

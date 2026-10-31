@@ -1,25 +1,26 @@
-//! The open project: parameters, the editable layout, undo history and what needs redrawing.
+//! The open project: site parameters, the editable layout, undo history and what needs redrawing.
 
 use std::collections::BTreeSet;
 
 use bevy::prelude::*;
 use urbanitas::mesh::build::WallMode;
 use urbanitas::parts::{Layout, PartId};
-use urbanitas::{BuildingParams, generate};
+use urbanitas::style::{Palette, StyleProfile};
+use urbanitas::{SiteParams, generate_site};
 
-const HISTORY_LIMIT: usize = 100;
+const HISTORY_LIMIT: usize = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// Tweak parameters and watch the building regenerate.
+    /// Tweak parameters and watch the site regenerate.
     Generate,
-    /// Edit the building part by part.
+    /// Edit the site part by part.
     Build,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Quality {
-    /// No shadows or MSAA, 256 px textures: for low-end PCs.
+    /// No shadows or MSAA, 256 px textures, a coarser terrain mesh: for low-end PCs.
     Low,
     High,
 }
@@ -31,11 +32,19 @@ impl Quality {
             Quality::High => 512,
         }
     }
+
+    /// Terrain grid points skipped between mesh vertices.
+    pub fn terrain_stride(self) -> usize {
+        match self {
+            Quality::Low => 2,
+            Quality::High => 1,
+        }
+    }
 }
 
 #[derive(Resource)]
 pub struct Project {
-    pub params: BuildingParams,
+    pub site: SiteParams,
     pub layout: Layout,
     pub error: Option<String>,
     pub mode: Mode,
@@ -44,11 +53,16 @@ pub struct Project {
     pub walls: WallMode,
     pub quality: Quality,
     pub selected: Option<PartId>,
+    /// A whole building selected (Shift+click).
+    pub selected_group: Option<u32>,
     pub status: String,
-    /// When a parameter change should regenerate the building (debounced).
+    /// When a parameter change should regenerate the site (debounced).
     pub regenerate_at: Option<f64>,
+    /// Bumped on every change, so pictures of the selection can refresh.
+    pub revision: u64,
     dirty_all: bool,
     dirty: BTreeSet<u32>,
+    terrain_dirty: bool,
     history: Vec<Layout>,
     future: Vec<Layout>,
     /// The last coalescing key passed to [`Project::edit`], so slider drags make one undo step.
@@ -56,24 +70,28 @@ pub struct Project {
 }
 
 impl Project {
-    pub fn new(params: BuildingParams, quality: Quality) -> Self {
+    pub fn new(site: SiteParams, quality: Quality) -> Self {
+        let style = site.building.style;
         let mut project = Self {
             layout: Layout::new(
                 "urbanitas",
-                urbanitas::style::StyleProfile::for_style(params.style),
-                placeholder_palette(),
+                StyleProfile::for_style(style),
+                Palette::choose(style, &mut urbanitas::rng::Rng::new(0)),
             ),
-            params,
+            site,
             error: None,
             mode: Mode::Generate,
             level: 0,
             walls: WallMode::Up,
             quality,
             selected: None,
+            selected_group: None,
             status: "Welcome to Urbanitas".into(),
             regenerate_at: None,
+            revision: 0,
             dirty_all: true,
             dirty: BTreeSet::new(),
+            terrain_dirty: true,
             history: Vec::new(),
             future: Vec::new(),
             last_edit: None,
@@ -82,16 +100,17 @@ impl Project {
         project
     }
 
-    /// Rebuilds the layout from the parameters. Undoable.
+    /// Rebuilds the layout from the site parameters. Undoable.
     pub fn regenerate(&mut self) {
-        match generate(&self.params) {
-            Ok(building) => {
+        match generate_site(&self.site) {
+            Ok(layout) => {
                 if !self.layout.parts.is_empty() {
                     self.snapshot(None);
                 }
-                self.layout = building.to_layout();
+                self.layout = layout;
                 self.error = None;
                 self.selected = None;
+                self.selected_group = None;
                 self.level = self.level.min(self.top_level());
                 self.mark_all();
             }
@@ -104,6 +123,7 @@ impl Project {
         self.snapshot(None);
         self.layout = layout;
         self.selected = None;
+        self.selected_group = None;
         self.level = 0;
         self.mark_all();
     }
@@ -165,6 +185,12 @@ impl Project {
         {
             self.selected = None;
         }
+        if self
+            .selected_group
+            .is_some_and(|g| self.layout.group_parts(g).next().is_none())
+        {
+            self.selected_group = None;
+        }
         self.status = status.into();
         self.mark_all();
     }
@@ -176,10 +202,18 @@ impl Project {
 
     pub fn mark_all(&mut self) {
         self.dirty_all = true;
+        self.terrain_dirty = true;
+        self.revision += 1;
     }
 
     pub fn mark(&mut self, levels: &[u32]) {
         self.dirty.extend(levels);
+        self.revision += 1;
+    }
+
+    pub fn mark_terrain(&mut self) {
+        self.terrain_dirty = true;
+        self.revision += 1;
     }
 
     /// Levels to rebuild, or `None` for everything; clears the request.
@@ -195,14 +229,11 @@ impl Project {
         Some(Some(std::mem::take(&mut self.dirty).into_iter().collect()))
     }
 
-    pub fn is_dirty(&self) -> bool {
-        self.dirty_all || !self.dirty.is_empty()
+    pub fn take_terrain_dirty(&mut self) -> bool {
+        std::mem::take(&mut self.terrain_dirty)
     }
-}
 
-fn placeholder_palette() -> urbanitas::style::Palette {
-    urbanitas::style::Palette::choose(
-        urbanitas::ArchitectureStyle::Mediterranean,
-        &mut urbanitas::rng::Rng::new(0),
-    )
+    pub fn is_dirty(&self) -> bool {
+        self.dirty_all || !self.dirty.is_empty() || self.terrain_dirty
+    }
 }

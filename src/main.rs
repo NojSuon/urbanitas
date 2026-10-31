@@ -9,7 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Parser, ValueEnum};
 use urbanitas::export::{json, obj, svg};
 use urbanitas::{
-    ArchitectureStyle, Building, BuildingParams, BuildingType, Garden, Size, generate,
+    ArchitectureStyle, Building, BuildingParams, BuildingType, Context, Garden, Shape, SiteParams,
+    Size, generate, generate_site,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -47,6 +48,18 @@ struct Cli {
     /// Architectural style.
     #[arg(long, value_enum, default_value_t = ArchitectureStyle::Mediterranean)]
     style: ArchitectureStyle,
+    /// Plan shape of the footprint.
+    #[arg(long, value_enum, default_value_t = Shape::Auto)]
+    shape: Shape,
+    /// The setting: one building, or a whole urban, suburban or rural site.
+    #[arg(long, value_enum, default_value_t = Context::Single)]
+    context: Context,
+    /// How many buildings an urban or suburban site gets.
+    #[arg(long, default_value_t = 6)]
+    buildings: u32,
+    /// Height of the hills, in metres (0 for flat ground).
+    #[arg(long, default_value_t = 0.0)]
+    relief: f64,
     /// Random seed; the same seed and parameters always give the same building. Random if omitted.
     #[arg(long)]
     seed: Option<u64>,
@@ -100,17 +113,27 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             rooms: cli.rooms,
             garden: cli.garden,
             style: cli.style,
+            shape: cli.shape,
         },
     };
     let building = generate(&params)?;
+    let site = SiteParams {
+        context: cli.context,
+        building: params.clone(),
+        buildings: cli.buildings,
+        relief: cli.relief,
+    };
     let stem = cli
         .name
         .as_deref()
         .map(sanitize)
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| building.name.clone());
+        .unwrap_or_else(|| match cli.context {
+            Context::Single => building.name.clone(),
+            _ => format!("urbanitas_{}_{}", site_slug(cli.context), params.seed),
+        });
 
-    let layout = building.to_layout();
+    let layout = generate_site(&site)?;
 
     fs::create_dir_all(&cli.out)?;
     let mut written = Vec::new();
@@ -131,7 +154,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         written.push(path);
     }
 
-    print_summary(&building);
+    if cli.context == Context::Single {
+        print_summary(&building);
+    } else {
+        println!("Urbanitas · {}", layout.description);
+    }
     written.sort();
     for path in written {
         println!("  wrote {}", path.display());
@@ -141,9 +168,10 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
 
 fn print_summary(b: &Building) {
     println!(
-        "Urbanitas · {} {} · seed {} · {:.1} × {:.1} m · {} floor(s) · {:.1} m tall",
+        "Urbanitas · {} {} · {} plan · seed {} · {:.1} × {:.1} m · {} floor(s) · {:.1} m tall",
         b.params.style.label(),
         b.params.building_type.label(),
+        b.shape.label(),
         b.params.seed,
         b.footprint.w,
         b.footprint.d,
@@ -152,7 +180,7 @@ fn print_summary(b: &Building) {
     );
     println!(
         "  roof: {} · palette: {} · garden: {}",
-        b.roof.label(),
+        b.roof_label(),
         b.palette.name,
         b.params.garden.label()
     );
@@ -163,6 +191,15 @@ fn print_summary(b: &Building) {
             .map(|r| format!("{} {:.1} m²", r.kind.label(), r.area))
             .collect();
         println!("  {}: {}", floor.name(), rooms.join(", "));
+    }
+}
+
+fn site_slug(context: Context) -> &'static str {
+    match context {
+        Context::Single => "building",
+        Context::Urban => "urban",
+        Context::Suburban => "suburban",
+        Context::Rural => "rural",
     }
 }
 

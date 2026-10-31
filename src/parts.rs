@@ -25,6 +25,12 @@ pub struct Part {
     pub id: PartId,
     /// Storey the part stands on; the ground floor is 0. Roofs sit on the level above the top floor.
     pub level: u32,
+    /// Height of the ground the part's building (or the part itself) stands on.
+    #[serde(default)]
+    pub ground: f64,
+    /// The building the part belongs to; parts of one building move and recolour together.
+    #[serde(default)]
+    pub group: Option<u32>,
     pub kind: PartKind,
 }
 
@@ -50,6 +56,55 @@ pub struct Wall {
     pub thickness: f64,
     /// Facade walls get plaster outside, string courses and the style's details.
     pub exterior: bool,
+    /// How far above its level's base the wall starts (upper facades start on top of the slab).
+    #[serde(default)]
+    pub base: f64,
+    #[serde(default)]
+    pub finish: WallFinish,
+}
+
+/// What kind of wall it is.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WallFinish {
+    /// Part of a building.
+    #[default]
+    Building,
+    /// A plastered garden wall with stone coping.
+    Garden,
+    /// A rough dry-stone field wall.
+    DryStone,
+    /// Wrought-iron railings on a low stone plinth.
+    Fence,
+}
+
+impl WallFinish {
+    pub fn label(self) -> &'static str {
+        match self {
+            WallFinish::Building => "Wall",
+            WallFinish::Garden => "Garden wall",
+            WallFinish::DryStone => "Dry-stone wall",
+            WallFinish::Fence => "Iron fence",
+        }
+    }
+
+    pub fn default_height(self) -> f64 {
+        match self {
+            WallFinish::Building => 3.2,
+            WallFinish::Garden => 2.2,
+            WallFinish::DryStone => 1.1,
+            WallFinish::Fence => 1.6,
+        }
+    }
+
+    pub fn default_thickness(self) -> f64 {
+        match self {
+            WallFinish::Building => 0.35,
+            WallFinish::Garden => 0.4,
+            WallFinish::DryStone => 0.55,
+            WallFinish::Fence => 0.3,
+        }
+    }
 }
 
 impl Wall {
@@ -154,6 +209,9 @@ pub struct RoofPart {
     /// The outside of the walls the roof covers; eaves overhang it.
     pub rect: Rect,
     pub roof: Roof,
+    /// Sides (south, north, west, east) that meet another roof or a taller wall: no parapet there.
+    #[serde(default)]
+    pub open: [bool; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -166,10 +224,26 @@ pub enum AreaKind {
     Pergola,
     Loggia,
     Hedge,
+    /// A paved internal courtyard ringed by an arcaded portico.
+    Courtyard,
+    /// Low box hedges in a geometric pattern.
+    Parterre,
+    /// A street paved with dark basalt cobbles.
+    Street,
+    /// A square paved with large stone slabs.
+    Piazza,
+    /// A white dirt road.
+    Road,
+    /// Rows of vines on posts.
+    Vineyard,
+    /// A belvedere tower.
+    Tower,
+    /// A level stone platform with retaining walls, for building on slopes.
+    Platform,
 }
 
 impl AreaKind {
-    pub const ALL: [AreaKind; 7] = [
+    pub const ALL: [AreaKind; 15] = [
         AreaKind::Lawn,
         AreaKind::Path,
         AreaKind::Terrace,
@@ -177,6 +251,14 @@ impl AreaKind {
         AreaKind::Pergola,
         AreaKind::Loggia,
         AreaKind::Hedge,
+        AreaKind::Courtyard,
+        AreaKind::Parterre,
+        AreaKind::Street,
+        AreaKind::Piazza,
+        AreaKind::Road,
+        AreaKind::Vineyard,
+        AreaKind::Tower,
+        AreaKind::Platform,
     ];
 
     pub fn label(self) -> &'static str {
@@ -188,6 +270,14 @@ impl AreaKind {
             AreaKind::Pergola => "Pergola",
             AreaKind::Loggia => "Loggia",
             AreaKind::Hedge => "Hedge",
+            AreaKind::Courtyard => "Courtyard",
+            AreaKind::Parterre => "Parterre",
+            AreaKind::Street => "Cobbled street",
+            AreaKind::Piazza => "Piazza",
+            AreaKind::Road => "Dirt road",
+            AreaKind::Vineyard => "Vineyard",
+            AreaKind::Tower => "Belvedere tower",
+            AreaKind::Platform => "Platform",
         }
     }
 
@@ -195,13 +285,30 @@ impl AreaKind {
     pub fn default_height(self) -> f64 {
         match self {
             AreaKind::Lawn => 0.1,
-            AreaKind::Path => 0.04,
-            AreaKind::Terrace => 0.05,
+            AreaKind::Path | AreaKind::Road => 0.04,
+            AreaKind::Terrace | AreaKind::Street | AreaKind::Piazza => 0.05,
             AreaKind::Pool => 1.4,
             AreaKind::Pergola => 2.6,
-            AreaKind::Loggia => 3.6,
+            AreaKind::Loggia | AreaKind::Courtyard => 3.6,
             AreaKind::Hedge => 1.1,
+            AreaKind::Parterre => 0.6,
+            AreaKind::Vineyard => 1.5,
+            AreaKind::Tower => 12.0,
+            AreaKind::Platform => 1.0,
         }
+    }
+
+    /// Thin ground coverings that are draped over the terrain.
+    pub fn drapes(self) -> bool {
+        matches!(
+            self,
+            AreaKind::Lawn
+                | AreaKind::Terrace
+                | AreaKind::Path
+                | AreaKind::Street
+                | AreaKind::Road
+                | AreaKind::Vineyard
+        )
     }
 }
 
@@ -224,15 +331,27 @@ pub enum PropKind {
     Bench,
     Column,
     Lamp,
+    /// A stone wellhead with an iron arch.
+    Well,
+    /// A stone urn on a pedestal.
+    Urn,
+    /// An Italian stone pine with a flat umbrella crown.
+    StonePine,
+    /// A date palm, common in Palermo gardens.
+    Palm,
 }
 
 impl PropKind {
-    pub const ALL: [PropKind; 8] = [
+    pub const ALL: [PropKind; 12] = [
         PropKind::OliveTree,
         PropKind::CypressTree,
         PropKind::LemonTree,
+        PropKind::StonePine,
+        PropKind::Palm,
         PropKind::Pot,
         PropKind::Fountain,
+        PropKind::Well,
+        PropKind::Urn,
         PropKind::Bench,
         PropKind::Column,
         PropKind::Lamp,
@@ -248,6 +367,10 @@ impl PropKind {
             PropKind::Bench => "Stone bench",
             PropKind::Column => "Column",
             PropKind::Lamp => "Lantern",
+            PropKind::Well => "Well",
+            PropKind::Urn => "Urn on pedestal",
+            PropKind::StonePine => "Stone pine",
+            PropKind::Palm => "Palm",
         }
     }
 
@@ -262,6 +385,10 @@ impl PropKind {
             PropKind::Bench => 1.6,
             PropKind::Column => 0.5,
             PropKind::Lamp => 0.4,
+            PropKind::Well => 1.4,
+            PropKind::Urn => 0.7,
+            PropKind::StonePine => 5.0,
+            PropKind::Palm => 2.4,
         }
     }
 
@@ -275,7 +402,22 @@ impl PropKind {
             PropKind::Bench => 0.5,
             PropKind::Column => 3.2,
             PropKind::Lamp => 2.6,
+            PropKind::Well => 2.2,
+            PropKind::Urn => 1.6,
+            PropKind::StonePine => 9.0,
+            PropKind::Palm => 6.5,
         }
+    }
+
+    pub fn is_tree(self) -> bool {
+        matches!(
+            self,
+            PropKind::OliveTree
+                | PropKind::CypressTree
+                | PropKind::LemonTree
+                | PropKind::StonePine
+                | PropKind::Palm
+        )
     }
 }
 
@@ -321,6 +463,7 @@ impl Part {
 
     pub fn label(&self) -> String {
         match &self.kind {
+            PartKind::Wall(w) if w.finish != WallFinish::Building => w.finish.label().into(),
             PartKind::Wall(w) if w.exterior => "Facade wall".into(),
             PartKind::Wall(_) => "Partition wall".into(),
             PartKind::Opening(o) => o.kind.label().into(),
@@ -357,6 +500,43 @@ impl Part {
             PartKind::Roof(r) => shift_rect(&mut r.rect),
             PartKind::Area(a) => shift_rect(&mut a.rect),
             PartKind::Prop(p) => shift(&mut p.at),
+        }
+    }
+
+    /// Turns the part half way round `centre`, so a building can face the other way.
+    pub fn rotate_half_about(&mut self, centre: P2) {
+        let flip = |p: &mut P2| *p = [2.0 * centre[0] - p[0], 2.0 * centre[1] - p[1]];
+        let flip_dir = |v: &mut P2| *v = [-v[0], -v[1]];
+        let flip_rect = |r: &mut Rect| {
+            *r = Rect::new(2.0 * centre[0] - r.x1(), 2.0 * centre[1] - r.z1(), r.w, r.d)
+        };
+        match &mut self.kind {
+            PartKind::Wall(w) => {
+                flip(&mut w.a);
+                flip(&mut w.b);
+            }
+            PartKind::Opening(o) => {
+                flip(&mut o.at);
+                flip_dir(&mut o.facing);
+            }
+            PartKind::Balcony(b) => {
+                flip(&mut b.at);
+                flip_dir(&mut b.facing);
+            }
+            PartKind::Floor(f) => flip_rect(&mut f.rect),
+            PartKind::Stairs(s) => {
+                flip_rect(&mut s.rect);
+                s.heading = s.heading.turned_right().turned_right();
+            }
+            PartKind::Roof(r) => {
+                flip_rect(&mut r.rect);
+                r.open = [r.open[1], r.open[0], r.open[3], r.open[2]];
+            }
+            PartKind::Area(a) => flip_rect(&mut a.rect),
+            PartKind::Prop(p) => {
+                flip(&mut p.at);
+                p.yaw += std::f64::consts::PI;
+            }
         }
     }
 
@@ -403,9 +583,16 @@ pub struct Layout {
     pub name: String,
     pub description: String,
     pub style: StyleProfile,
+    /// The default palette, for parts outside any building.
     pub palette: Palette,
     pub parts: Vec<Part>,
     pub next_id: PartId,
+    /// Each building's own colours, indexed by `Part::group`.
+    #[serde(default)]
+    pub palettes: Vec<Palette>,
+    /// The ground, if the site has relief.
+    #[serde(default)]
+    pub terrain: Option<crate::terrain::Terrain>,
 }
 
 impl Layout {
@@ -418,13 +605,69 @@ impl Layout {
             palette,
             parts: Vec::new(),
             next_id: 1,
+            palettes: Vec::new(),
+            terrain: None,
         }
+    }
+
+    /// Adds a part standing at `ground` height as part of building `group`.
+    pub fn add_in(
+        &mut self,
+        level: u32,
+        ground: f64,
+        group: Option<u32>,
+        kind: PartKind,
+    ) -> PartId {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.parts.push(Part {
+            id,
+            level,
+            ground,
+            group,
+            kind,
+        });
+        id
+    }
+
+    /// The colours of building `group` (or the default palette).
+    pub fn palette_of(&self, group: Option<u32>) -> &Palette {
+        group
+            .and_then(|g| self.palettes.get(g as usize))
+            .unwrap_or(&self.palette)
+    }
+
+    /// Registers a new building's palette and returns its group.
+    pub fn new_group(&mut self, palette: Palette) -> u32 {
+        self.palettes.push(palette);
+        (self.palettes.len() - 1) as u32
+    }
+
+    /// Every part of building `group`.
+    pub fn group_parts(&self, group: u32) -> impl Iterator<Item = &Part> {
+        self.parts.iter().filter(move |p| p.group == Some(group))
+    }
+
+    /// Height of a part's base (the underside of its level's slab) above sea level.
+    pub fn base(&self, part: &Part) -> f64 {
+        part.ground + self.elevation(part.level)
+    }
+
+    /// Height of the terrain at `p` (zero without terrain).
+    pub fn ground_at(&self, p: P2) -> f64 {
+        self.terrain.as_ref().map_or(0.0, |t| t.height_at(p))
     }
 
     pub fn add(&mut self, level: u32, kind: PartKind) -> PartId {
         let id = self.next_id;
         self.next_id += 1;
-        self.parts.push(Part { id, level, kind });
+        self.parts.push(Part {
+            id,
+            level,
+            ground: 0.0,
+            group: None,
+            kind,
+        });
         id
     }
 
@@ -481,7 +724,13 @@ impl Layout {
 
     /// The wall on `level` that `at` lies on, if any: the closest one whose body contains it.
     pub fn host_wall(&self, level: u32, at: P2) -> Option<(&Part, &Wall)> {
+        self.host_wall_in(level, None, at)
+    }
+
+    /// Like [`Layout::host_wall`], but only walls of building `group` when it is given.
+    pub fn host_wall_in(&self, level: u32, group: Option<u32>, at: P2) -> Option<(&Part, &Wall)> {
         self.on_level(level)
+            .filter(move |p| group.is_none() || p.group == group)
             .filter_map(|p| match &p.kind {
                 PartKind::Wall(w) => Some((p, w)),
                 _ => None,

@@ -76,18 +76,68 @@ pub enum ArchitectureStyle {
     /// Renaissance Tuscan: ochre plaster over a rusticated stone base, stone-framed
     /// arched windows, a deep cornice and wide tiled eaves, loggias and fountains.
     Florentine,
+    /// Sicilian Renaissance and Baroque palazzi: warm yellow plaster, stone quoins and
+    /// pedimented window frames, wrought-iron balconies on every main-floor window,
+    /// flat roof terraces behind balustrades, and courtyards.
+    Palermitan,
 }
 
 impl ArchitectureStyle {
-    pub const ALL: [ArchitectureStyle; 2] = [
+    pub const ALL: [ArchitectureStyle; 3] = [
         ArchitectureStyle::Mediterranean,
         ArchitectureStyle::Florentine,
+        ArchitectureStyle::Palermitan,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             ArchitectureStyle::Mediterranean => "Mediterranean",
             ArchitectureStyle::Florentine => "Florentine",
+            ArchitectureStyle::Palermitan => "Palermitan",
+        }
+    }
+}
+
+/// The plan shape of a building's footprint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Shape {
+    /// Chosen from the seed, the building type and the style.
+    #[default]
+    Auto,
+    Block,
+    /// A street range with a wing behind it at one end.
+    L,
+    /// A street range with a wing behind its middle.
+    T,
+    /// A street range with wings behind both ends around an open garden court.
+    U,
+    /// A palazzo: four ranges around an internal courtyard (cortile).
+    Courtyard,
+    /// A street range with a narrower, offset block behind it.
+    Stepped,
+}
+
+impl Shape {
+    pub const ALL: [Shape; 7] = [
+        Shape::Auto,
+        Shape::Block,
+        Shape::L,
+        Shape::T,
+        Shape::U,
+        Shape::Courtyard,
+        Shape::Stepped,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Shape::Auto => "Auto",
+            Shape::Block => "Block",
+            Shape::L => "L-shaped",
+            Shape::T => "T-shaped",
+            Shape::U => "U-shaped",
+            Shape::Courtyard => "Courtyard",
+            Shape::Stepped => "Stepped",
         }
     }
 }
@@ -121,6 +171,7 @@ pub struct BuildingParams {
     pub rooms: u32,
     pub garden: Garden,
     pub style: ArchitectureStyle,
+    pub shape: Shape,
 }
 
 impl Default for BuildingParams {
@@ -133,6 +184,7 @@ impl Default for BuildingParams {
             rooms: 4,
             garden: Garden::Front,
             style: ArchitectureStyle::Mediterranean,
+            shape: Shape::Auto,
         }
     }
 }

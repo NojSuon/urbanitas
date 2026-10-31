@@ -312,6 +312,70 @@ fn texel(material: Material, palette: &Palette, u: f64, v: f64, speck: f64, seed
             0.88 + 0.2 * fbm(u, v, 6, 3, seed) + speck * 0.05,
         ),
         Material::Lemon => shade([0.96, 0.82, 0.2], 0.9 + 0.15 * fbm(u, v, 4, 2, seed)),
+        Material::Earth => {
+            // A strada bianca: pale, dusty, with darker ruts and pebbles.
+            let base = [0.84, 0.78, 0.66];
+            let dust = fbm(u, v, 5, 4, seed);
+            let rut = ((u * 2.0 * PI).sin().abs()).powi(8) * 0.12;
+            shade(base, 0.86 + 0.18 * dust - rut + speck * 0.08)
+        }
+        Material::Basalt => {
+            // Dark cobbles in staggered rows, with pale joints.
+            let rows = 8.0;
+            let row = (v * rows).floor();
+            let shift = if row as i64 % 2 == 1 { 0.5 / 8.0 } else { 0.0 };
+            let (cx, cy, fx, fy) = cell((u + shift).rem_euclid(1.0), v, 8.0, rows);
+            let edge = (fx - 0.5).abs().max((fy - 0.5).abs());
+            if edge > 0.44 {
+                return [0.55, 0.53, 0.5];
+            }
+            let tint = hash(cx, cy, seed) - 0.5;
+            let dome = 1.0 - edge * 0.5;
+            shade([0.3, 0.3, 0.31], (0.85 + tint * 0.25 + speck * 0.1) * dome)
+        }
+        Material::Slabs => {
+            // Large stone flags, three to a course, staggered.
+            let base = mix(rgb(palette.stone), [0.72, 0.68, 0.6], 0.5);
+            let rows = 4.0;
+            let row = (v * rows).floor();
+            let shift = if row as i64 % 2 == 1 { 1.0 / 6.0 } else { 0.0 };
+            let (cx, cy, fx, fy) = cell((u + shift).rem_euclid(1.0), v, 3.0, rows);
+            if fx < 0.015 || fy < 0.02 {
+                return shade(base, 0.55);
+            }
+            let tint = hash(cx, cy, seed) - 0.5;
+            shade(
+                base,
+                0.86 + tint * 0.16 + fbm(u, v, 8, 3, seed) * 0.12 + speck * 0.05,
+            )
+        }
+        Material::Rubble => {
+            // Irregular field stones: jittered cells, dark gaps between them.
+            let n = 10.0;
+            let (x, y) = (u * n, v * n);
+            let (ix, iy) = (x.floor() as i64, y.floor() as i64);
+            let mut best = (f64::MAX, f64::MAX, 0i64, 0i64);
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let (cx, cy) = (ix + dx, iy + dy);
+                    let (wx, wy) = (cx.rem_euclid(n as i64), cy.rem_euclid(n as i64));
+                    let px = cx as f64 + 0.2 + 0.6 * hash(wx, wy, seed);
+                    let py = cy as f64 + 0.2 + 0.6 * hash(wx, wy, seed + 1);
+                    let d = ((x - px).powi(2) + (y - py).powi(2)).sqrt();
+                    if d < best.0 {
+                        best = (d, best.0, wx, wy);
+                    } else if d < best.1 {
+                        best.1 = d;
+                    }
+                }
+            }
+            let gap = best.1 - best.0;
+            if gap < 0.08 {
+                return [0.22, 0.2, 0.17];
+            }
+            let tint = hash(best.2, best.3, seed + 2) - 0.5;
+            shade(rgb(palette.stone), 0.78 + tint * 0.3 + speck * 0.1)
+        }
     }
 }
 

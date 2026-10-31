@@ -115,10 +115,18 @@ pub enum Material {
     CypressLeaf,
     Terracotta,
     Lemon,
+    /// Dusty white earth: country roads and steep ground.
+    Earth,
+    /// Dark basalt cobbles.
+    Basalt,
+    /// Large rectangular paving slabs.
+    Slabs,
+    /// Rough dry-stone walling.
+    Rubble,
 }
 
 impl Material {
-    pub const ALL: [Material; 19] = [
+    pub const ALL: [Material; 23] = [
         Material::Plaster,
         Material::InteriorPlaster,
         Material::Rustication,
@@ -138,6 +146,10 @@ impl Material {
         Material::CypressLeaf,
         Material::Terracotta,
         Material::Lemon,
+        Material::Earth,
+        Material::Basalt,
+        Material::Slabs,
+        Material::Rubble,
     ];
 
     pub fn name(self) -> &'static str {
@@ -161,7 +173,26 @@ impl Material {
             Material::CypressLeaf => "cypress_leaf",
             Material::Terracotta => "terracotta",
             Material::Lemon => "lemon",
+            Material::Earth => "earth",
+            Material::Basalt => "basalt",
+            Material::Slabs => "slabs",
+            Material::Rubble => "rubble",
         }
+    }
+
+    /// Takes its colour from the building's palette (so each building needs its own texture).
+    pub fn uses_palette(self) -> bool {
+        matches!(
+            self,
+            Material::Plaster
+                | Material::Rustication
+                | Material::Stone
+                | Material::Shutter
+                | Material::Door
+                | Material::RoofTile
+                | Material::Slabs
+                | Material::Rubble
+        )
     }
 
     /// Metres of surface covered by one repeat of the texture.
@@ -175,6 +206,9 @@ impl Material {
             Material::Water => 3.0,
             Material::Terracotta => 0.5,
             Material::Lemon => 0.3,
+            Material::Earth | Material::Slabs => 3.0,
+            Material::Basalt => 1.2,
+            Material::Rubble => 2.0,
             _ => 1.0,
         }
     }

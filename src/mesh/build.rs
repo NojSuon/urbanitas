@@ -42,7 +42,11 @@ struct WallInfo {
     frame: Frame,
     start: f64,
     end: f64,
+    /// Where the wall itself starts.
     base: f64,
+    /// The base of its level, which openings measure their sills from.
+    level_base: f64,
+    group: Option<u32>,
     outer: Material,
     inner: Material,
     edge: Material,
@@ -53,6 +57,8 @@ struct WallInfo {
 
 struct Post {
     level: u32,
+    group: Option<u32>,
+    base: f64,
     at: P2,
     size: f64,
     height: f64,
@@ -66,7 +72,8 @@ pub struct Scene<'a> {
     walls: HashMap<PartId, WallInfo>,
     mounts: HashMap<PartId, Vec<&'a Part>>,
     posts: Vec<Post>,
-    centroids: HashMap<u32, P2>,
+    /// The middle of each building's floor area on each level.
+    centroids: HashMap<(Option<u32>, u32), P2>,
 }
 
 /// A hole through a wall, in the wall frame (`v` is the absolute height).
@@ -110,29 +117,33 @@ fn along(frame: &Frame, p: P2) -> f64 {
 impl<'a> Scene<'a> {
     pub fn new(layout: &'a Layout) -> Self {
         let style = &layout.style;
-        let top_level = layout.parts.iter().map(|p| p.level).max().unwrap_or(0);
-        let mut centroids = HashMap::new();
-        for level in 0..=top_level {
-            let (mut sx, mut sz, mut sw) = (0.0, 0.0, 0.0);
-            for p in layout.on_level(level) {
-                if let PartKind::Floor(f) = &p.kind {
+        let mut floor_sums: HashMap<(Option<u32>, u32), (f64, f64, f64)> = HashMap::new();
+        let mut wall_sums: HashMap<(Option<u32>, u32), (f64, f64, f64)> = HashMap::new();
+        for p in &layout.parts {
+            let key = (p.group, p.level);
+            match &p.kind {
+                PartKind::Floor(f) => {
                     let (cx, cz) = f.rect.center();
                     let a = f.rect.area();
-                    (sx, sz, sw) = (sx + cx * a, sz + cz * a, sw + a);
+                    let e = floor_sums.entry(key).or_default();
+                    *e = (e.0 + cx * a, e.1 + cz * a, e.2 + a);
                 }
-            }
-            if sw == 0.0 {
-                for p in layout.on_level(level) {
-                    if let PartKind::Wall(w) = &p.kind {
-                        let l = w.length();
-                        sx += (w.a[0] + w.b[0]) / 2.0 * l;
-                        sz += (w.a[1] + w.b[1]) / 2.0 * l;
-                        sw += l;
-                    }
+                PartKind::Wall(w) if w.finish == WallFinish::Building => {
+                    let l = w.length();
+                    let e = wall_sums.entry(key).or_default();
+                    *e = (
+                        e.0 + (w.a[0] + w.b[0]) / 2.0 * l,
+                        e.1 + (w.a[1] + w.b[1]) / 2.0 * l,
+                        e.2 + l,
+                    );
                 }
+                _ => {}
             }
+        }
+        let mut centroids = HashMap::new();
+        for (key, (sx, sz, sw)) in wall_sums.into_iter().chain(floor_sums) {
             if sw > 0.0 {
-                centroids.insert(level, [sx / sw, sz / sw]);
+                centroids.insert(key, [sx / sw, sz / sw]);
             }
         }
 
@@ -151,17 +162,20 @@ impl<'a> Scene<'a> {
             let dir = w.dir();
             let mid = w.point_at(len / 2.0);
             let mut frame = Frame::upright(V3::ground(w.a, 0.0), dir);
-            if let Some(c) = centroids.get(&part.level) {
+            if let Some(c) = centroids.get(&(part.group, part.level)) {
                 if w.exterior && ground_dot(&frame, [mid[0] - c[0], mid[1] - c[1]]) < 0.0 {
                     frame = frame.flipped();
                 }
             }
-            let outer = if !w.exterior {
-                Material::InteriorPlaster
-            } else if part.level == 0 && style.rusticated_ground {
-                Material::Rustication
-            } else {
-                Material::Plaster
+            let outer = match w.finish {
+                WallFinish::Garden => Material::Plaster,
+                WallFinish::DryStone => Material::Rubble,
+                WallFinish::Fence => Material::Stone,
+                WallFinish::Building if !w.exterior => Material::InteriorPlaster,
+                WallFinish::Building if part.level == 0 && style.rusticated_ground => {
+                    Material::Rustication
+                }
+                WallFinish::Building => Material::Plaster,
             };
             let edge = match outer {
                 Material::Rustication => Material::Stone,
@@ -171,7 +185,10 @@ impl<'a> Scene<'a> {
             let mut trims = [0.0f64; 2];
             for (end, p) in [w.a, w.b].into_iter().enumerate() {
                 for &(other_part, other) in &all_walls {
-                    if other_part.id == part.id || other_part.level != part.level {
+                    if other_part.id == part.id
+                        || other_part.level != part.level
+                        || other_part.group != part.group
+                    {
                         continue;
                     }
                     let (_, d) = other.closest(p);
@@ -207,6 +224,8 @@ impl<'a> Scene<'a> {
                         }
                         None => posts.push(Post {
                             level: part.level,
+                            group: part.group,
+                            base: layout.base(part) + w.base.min(other.base),
                             at: p,
                             size,
                             height,
@@ -222,9 +241,11 @@ impl<'a> Scene<'a> {
                     frame,
                     start: trims[0],
                     end: len - trims[1],
-                    base: layout.elevation(part.level),
+                    base: layout.base(part) + w.base,
+                    level_base: layout.base(part),
+                    group: part.group,
                     outer,
-                    inner: if w.exterior {
+                    inner: if w.exterior || w.finish != WallFinish::Building {
                         Material::InteriorPlaster
                     } else {
                         outer
@@ -244,7 +265,7 @@ impl<'a> Scene<'a> {
                 PartKind::Balcony(b) => b.at,
                 _ => continue,
             };
-            if let Some((host, _)) = layout.host_wall(part.level, at) {
+            if let Some((host, _)) = layout.host_wall_in(part.level, part.group, at) {
                 mounts.entry(host.id).or_default().push(part);
             }
         }
@@ -294,21 +315,45 @@ impl<'a> Scene<'a> {
     /// The square posts that fill the joints where walls on `level` meet.
     pub fn build_posts(&self, level: u32, view: &View) -> MeshSet {
         let mut set = MeshSet::default();
-        let base = self.layout.elevation(level);
         for post in self.posts.iter().filter(|p| p.level == level) {
-            let cap = post
-                .walls
-                .iter()
-                .filter_map(|id| self.walls.get(id).and_then(|w| self.wall_cap(w, view)))
-                .fold(None, |acc: Option<f64>, c| {
-                    Some(acc.map_or(c, |a| a.min(c)))
-                });
-            let height = cap.map_or(post.height, |c| c.min(post.height));
-            let s = post.size;
-            let rect = Rect::new(post.at[0] - s / 2.0, post.at[1] - s / 2.0, s, s);
-            set.slab(&rect, base, base + height, FaceMats::all(post.material));
+            self.post_into(&mut set, post, view);
         }
         set
+    }
+
+    /// The corner posts on `level`, one set per building.
+    pub fn build_posts_by_group(&self, level: u32, view: &View) -> Vec<(Option<u32>, MeshSet)> {
+        let mut out: Vec<(Option<u32>, MeshSet)> = Vec::new();
+        for post in self.posts.iter().filter(|p| p.level == level) {
+            let i = match out.iter().position(|(g, _)| *g == post.group) {
+                Some(i) => i,
+                None => {
+                    out.push((post.group, MeshSet::default()));
+                    out.len() - 1
+                }
+            };
+            self.post_into(&mut out[i].1, post, view);
+        }
+        out
+    }
+
+    fn post_into(&self, set: &mut MeshSet, post: &Post, view: &View) {
+        let cap = post
+            .walls
+            .iter()
+            .filter_map(|id| self.walls.get(id).and_then(|w| self.wall_cap(w, view)))
+            .fold(None, |acc: Option<f64>, c| {
+                Some(acc.map_or(c, |a| a.min(c)))
+            });
+        let height = cap.map_or(post.height, |c| c.min(post.height));
+        let s = post.size;
+        let rect = Rect::new(post.at[0] - s / 2.0, post.at[1] - s / 2.0, s, s);
+        set.slab(
+            &rect,
+            post.base,
+            post.base + height,
+            FaceMats::all(post.material),
+        );
     }
 
     fn part_into(&self, set: &mut MeshSet, part: &Part, view: &View) {
@@ -334,7 +379,7 @@ impl<'a> Scene<'a> {
                 let toward_camera = if info.exterior {
                     -ground_dot(&info.frame, look)
                 } else {
-                    let c = self.centroids.get(&info.level)?;
+                    let c = self.centroids.get(&(info.group, info.level))?;
                     -((info.mid[0] - c[0]) * look[0] + (info.mid[1] - c[1]) * look[1])
                 };
                 (toward_camera > 0.25).then_some(CUT_HEIGHT)
@@ -353,7 +398,7 @@ impl<'a> Scene<'a> {
     ) -> (Frame, f64, f64, bool, Option<f64>) {
         let host = self
             .layout
-            .host_wall(part.level, at)
+            .host_wall_in(part.level, part.group, at)
             .and_then(|(hp, w)| self.walls.get(&hp.id).map(|info| (w, info)));
         match host {
             Some((w, info)) => {
@@ -401,14 +446,18 @@ impl<'a> Scene<'a> {
             let mut hole = Hole {
                 u0: (centre - o.width / 2.0).max(info.start),
                 u1: (centre + o.width / 2.0).min(info.end),
-                v0: y0 + o.sill,
-                v1: y0 + o.sill + o.height,
-                arched: o.arched,
+                v0: info.level_base + o.sill,
+                v1: if o.kind == OpeningKind::Gate {
+                    y1 + 1.0
+                } else {
+                    info.level_base + o.sill + o.height
+                },
+                arched: o.arched && o.kind != OpeningKind::Gate,
             };
             if hole.v0 >= y1 - 0.01 || hole.u1 - hole.u0 < 0.05 {
                 continue;
             }
-            if cap.is_some() && hole.v1 > y1 - 0.05 {
+            if o.kind == OpeningKind::Gate || (cap.is_some() && hole.v1 > y1 - 0.05) {
                 hole.v1 = y1;
                 hole.arched = false;
             } else if hole.v1 > y1 - 0.05 {
@@ -432,17 +481,112 @@ impl<'a> Scene<'a> {
             top: info.edge,
             bottom: info.edge,
         };
+        // A fence is a low stone plinth carrying iron railings.
+        let solid_top = if w.finish == WallFinish::Fence {
+            (y0 + 0.5).min(y1)
+        } else {
+            y1
+        };
         wall_with_holes(
             set,
             &info.frame,
             info.start,
             info.end,
             y0,
-            y1,
+            solid_top,
             half,
             &kept,
             mats,
         );
+        let gaps = |u: f64| kept.iter().any(|h| u > h.u0 - 0.05 && u < h.u1 + 0.05);
+        match w.finish {
+            WallFinish::Garden if cap.is_none() => {
+                let mut cursor = info.start;
+                for h in kept.iter().chain(std::iter::once(&Hole {
+                    u0: info.end,
+                    u1: info.end,
+                    v0: 0.0,
+                    v1: 0.0,
+                    arched: false,
+                })) {
+                    set.cuboid(
+                        &info.frame,
+                        (cursor, h.u0),
+                        (y1, y1 + 0.08),
+                        (-half - 0.05, half + 0.05),
+                        FaceMats::all(Material::Stone),
+                    );
+                    cursor = h.u1;
+                }
+            }
+            WallFinish::Fence if y1 > solid_top + 0.1 => {
+                let iron = FaceMats::all(Material::Iron);
+                let mut u = info.start + 0.06;
+                while u < info.end - 0.06 {
+                    if !gaps(u) {
+                        set.cuboid(
+                            &info.frame,
+                            (u - 0.015, u + 0.015),
+                            (solid_top, y1 - 0.06),
+                            (-0.015, 0.015),
+                            iron,
+                        );
+                    }
+                    u += 0.14;
+                }
+                let mut cursor = info.start;
+                for h in kept.iter().chain(std::iter::once(&Hole {
+                    u0: info.end,
+                    u1: info.end,
+                    v0: 0.0,
+                    v1: 0.0,
+                    arched: false,
+                })) {
+                    set.cuboid(
+                        &info.frame,
+                        (cursor, h.u0),
+                        (y1 - 0.08, y1 - 0.03),
+                        (-0.03, 0.03),
+                        iron,
+                    );
+                    cursor = h.u1;
+                }
+            }
+            _ => {}
+        }
+
+        // Quoins: alternating long and short stone blocks up the corners.
+        if w.exterior && style.quoins && cap.is_none() {
+            let rows = ((y1 - y0) / 0.42).floor() as usize;
+            for k in 0..rows {
+                let long = if k % 2 == 0 { 0.75 } else { 0.42 };
+                let (v0, v1) = (
+                    y0 + k as f64 * 0.42 + 0.02,
+                    y0 + (k + 1) as f64 * 0.42 - 0.02,
+                );
+                let n = (half, half + 0.035);
+                if info.start > 1e-6 {
+                    let u0 = info.start - half;
+                    set.cuboid(
+                        &info.frame,
+                        (u0, u0 + long),
+                        (v0, v1),
+                        n,
+                        FaceMats::all(Material::Stone),
+                    );
+                }
+                if info.end < w.length() - 1e-6 {
+                    let u1 = info.end + half;
+                    set.cuboid(
+                        &info.frame,
+                        (u1 - long, u1),
+                        (v0, v1),
+                        n,
+                        FaceMats::all(Material::Stone),
+                    );
+                }
+            }
+        }
 
         // String course at each floor line and a plinth at the ground.
         if w.exterior && style.string_courses && y1 - y0 > 0.6 {
@@ -493,7 +637,11 @@ impl<'a> Scene<'a> {
             return; // cut-down walls show the hole, not the fittings
         }
         let style = &self.layout.style;
-        let base = self.layout.elevation(part.level);
+        let base = self.layout.base(part);
+        if o.kind == OpeningKind::Gate {
+            self.gate(set, part, o, &frame, centre, half.max(0.2), base);
+            return;
+        }
         let hole = Hole {
             u0: centre - o.width / 2.0,
             u1: centre + o.width / 2.0,
@@ -598,7 +746,7 @@ impl<'a> Scene<'a> {
                     );
                 }
             }
-            OpeningKind::Archway => {}
+            OpeningKind::Archway | OpeningKind::Gate => {}
         }
 
         if !exterior {
@@ -642,6 +790,20 @@ impl<'a> Scene<'a> {
                     n,
                     stone,
                 );
+                if style.pediments
+                    && matches!(o.kind, OpeningKind::Window | OpeningKind::BalconyDoor)
+                    && o.height > 1.0
+                {
+                    pediment(
+                        set,
+                        &frame,
+                        hole.u0 - sw - 0.08,
+                        hole.u1 + sw + 0.08,
+                        hole.v1 + sw,
+                        half,
+                        hash3(V3::ground(o.at, 0.0), 5) < 0.5,
+                    );
+                }
             }
         }
 
@@ -673,7 +835,7 @@ impl<'a> Scene<'a> {
     fn balcony(&self, set: &mut MeshSet, part: &Part, b: &BalconyPart) {
         let (frame, centre, half, _, _) = self.mount_frame(part, b.at, b.facing, &View::default());
         let style = &self.layout.style;
-        let base = self.layout.elevation(part.level);
+        let base = self.layout.base(part);
         let floor = base + style.slab_thickness;
         let (u0, u1) = (centre - b.width / 2.0, centre + b.width / 2.0);
         let (n0, n1) = (half, half + b.depth);
@@ -723,14 +885,14 @@ impl<'a> Scene<'a> {
             .map(|&(r, y)| (r, y * h))
             .collect();
             let mut spots: Vec<(f64, f64)> = Vec::new();
-            let along_front = ((b.width - 0.3) / 0.22).floor() as usize;
+            let along_front = ((b.width - 0.3) / 0.26).floor() as usize;
             for k in 0..=along_front {
                 spots.push((
                     u0 + 0.15 + (b.width - 0.3) * k as f64 / along_front.max(1) as f64,
                     n1 - w / 2.0,
                 ));
             }
-            let along_side = ((b.depth - 0.3) / 0.22).floor() as usize;
+            let along_side = ((b.depth - 0.3) / 0.26).floor() as usize;
             for k in 0..along_side {
                 let n = n0 + 0.1 + (b.depth - 0.3) * k as f64 / along_side.max(1) as f64;
                 spots.push((u0 + w / 2.0, n));
@@ -741,7 +903,7 @@ impl<'a> Scene<'a> {
                     Material::Stone,
                     frame.at(u, floor + 0.1, n),
                     &profile,
-                    8,
+                    5,
                     true,
                 );
             }
@@ -765,15 +927,39 @@ impl<'a> Scene<'a> {
                 );
             }
             let posts = ((u1 - u0) / 0.14).floor() as usize;
-            for p in 0..=posts {
-                let u = u0 + (u1 - u0 - bar) * p as f64 / posts.max(1) as f64;
+            if style.curved_railings {
+                // "Petto d'oca": the bars swell outwards near the bottom like a goose's breast.
+                let bulge = 0.22;
                 set.cuboid(
                     &frame,
-                    (u, u + bar),
-                    (floor, floor + rail),
-                    (n1 - bar, n1),
+                    (u0, u1),
+                    (floor + 0.3, floor + 0.34),
+                    (n1 + bulge - 0.03, n1 + bulge),
                     iron,
                 );
+                for p in 0..=posts {
+                    let u = u0 + 0.02 + (u1 - u0 - 0.04) * p as f64 / posts.max(1) as f64;
+                    let points = [
+                        frame.at(u, floor, n1 - 0.02),
+                        frame.at(u, floor + 0.32, n1 + bulge - 0.015),
+                        frame.at(u, floor + 0.72, n1 + 0.04),
+                        frame.at(u, floor + rail, n1 - 0.025),
+                    ];
+                    for pair in points.windows(2) {
+                        set.cylinder(Material::Iron, pair[0], pair[1], 0.012, 4);
+                    }
+                }
+            } else {
+                for p in 0..=posts {
+                    let u = u0 + (u1 - u0 - bar) * p as f64 / posts.max(1) as f64;
+                    set.cuboid(
+                        &frame,
+                        (u, u + bar),
+                        (floor, floor + rail),
+                        (n1 - bar, n1),
+                        iron,
+                    );
+                }
             }
             let side_posts = (b.depth / 0.14).floor() as usize;
             for p in 1..side_posts {
@@ -792,7 +978,7 @@ impl<'a> Scene<'a> {
     }
 
     fn floor(&self, set: &mut MeshSet, part: &Part, f: &FloorPart) {
-        let base = self.layout.elevation(part.level);
+        let base = self.layout.base(part);
         let top = if f.room == Some(RoomKind::Bathroom) {
             Material::Stone
         } else {
@@ -804,7 +990,7 @@ impl<'a> Scene<'a> {
 
     fn stairs(&self, set: &mut MeshSet, part: &Part, s: &StairsPart) {
         let r = s.rect;
-        let base = self.layout.elevation(part.level) + self.layout.style.slab_thickness;
+        let base = self.layout.base(part) + self.layout.style.slab_thickness;
         let (origin, run_dir, width_dir, run_len, width) = match s.heading {
             Heading::North => ([r.x, r.z], [0.0, 1.0], [1.0, 0.0], r.d, r.w),
             Heading::South => ([r.x1(), r.z1()], [0.0, -1.0], [-1.0, 0.0], r.d, r.w),
@@ -835,7 +1021,7 @@ impl<'a> Scene<'a> {
 
     fn roof(&self, set: &mut MeshSet, part: &Part, r: &RoofPart) {
         let style = &self.layout.style;
-        let base = self.layout.elevation(part.level);
+        let base = self.layout.base(part);
         let inner = r.rect.grow(-style.wall_thickness / 2.0);
         let ceiling_top = match r.roof {
             Roof::Flat { .. } => Material::Cotto,
@@ -849,31 +1035,60 @@ impl<'a> Scene<'a> {
         );
         let y = base + style.slab_thickness;
         match r.roof {
-            Roof::Flat { parapet_height } => {
+            Roof::Flat {
+                parapet_height,
+                balustrade,
+            } => {
                 let (rect, t) = (r.rect, 0.25);
                 let h = y + parapet_height;
-                for band in [
-                    Rect::new(rect.x, rect.z, rect.w, t),
-                    Rect::new(rect.x, rect.z1() - t, rect.w, t),
-                    Rect::new(rect.x, rect.z + t, t, rect.d - 2.0 * t),
-                    Rect::new(rect.x1() - t, rect.z + t, t, rect.d - 2.0 * t),
-                ] {
-                    set.slab(
-                        &band,
-                        y,
-                        h,
-                        FaceMats::with_top(Material::Plaster, Material::Stone),
+                if style.cornice_depth > 0.0 && !r.open.iter().any(|o| *o) {
+                    let d = style.cornice_depth;
+                    let hc = d * 0.8;
+                    let profile = [
+                        (0.0, 0.0),
+                        (0.15 * d, 0.0),
+                        (0.15 * d, 0.2 * hc),
+                        (0.5 * d, 0.45 * hc),
+                        (0.55 * d, 0.7 * hc),
+                        (d, hc),
+                        (d, hc + 0.08),
+                    ];
+                    set.extrude_loop(
+                        Material::Stone,
+                        &rect_corners(&rect, y - 0.08 - hc),
+                        &profile,
                     );
                 }
-                let corners = rect_corners(&rect, h);
-                let coping = [
-                    (-t - 0.03, 0.0),
-                    (0.04, 0.0),
-                    (0.04, 0.07),
-                    (-t - 0.03, 0.07),
-                    (-t - 0.03, 0.0),
+                // South, north, west, east; side bands stop short of the end bands they meet.
+                let z0 = if r.open[0] { rect.z } else { rect.z + t };
+                let z1 = if r.open[1] { rect.z1() } else { rect.z1() - t };
+                let bands = [
+                    Rect::new(rect.x, rect.z, rect.w, t),
+                    Rect::new(rect.x, rect.z1() - t, rect.w, t),
+                    Rect::new(rect.x, z0, t, z1 - z0),
+                    Rect::new(rect.x1() - t, z0, t, z1 - z0),
                 ];
-                set.extrude_loop(Material::Stone, &corners, &coping);
+                for (k, band) in bands.iter().enumerate() {
+                    if r.open[k] {
+                        continue;
+                    }
+                    if balustrade {
+                        balustrade_band(set, band, y, parapet_height);
+                    } else {
+                        set.slab(
+                            band,
+                            y,
+                            h,
+                            FaceMats::with_top(Material::Plaster, Material::Stone),
+                        );
+                        set.slab(
+                            &band.grow(0.03),
+                            h,
+                            h + 0.07,
+                            FaceMats::all(Material::Stone),
+                        );
+                    }
+                }
             }
             Roof::Hip {
                 overhang,
@@ -912,11 +1127,59 @@ impl<'a> Scene<'a> {
     }
 
     fn area(&self, set: &mut MeshSet, part: &Part, a: &AreaPart) {
-        let base = self.layout.elevation(part.level);
+        let base = self.layout.base(part);
         let r = a.rect;
         let style = &self.layout.style;
+        if let Some(terrain) = self.layout.terrain.as_ref().filter(|_| a.kind.drapes()) {
+            self.drape(set, a, terrain);
+            return;
+        }
         match a.kind {
             AreaKind::Lawn => set.slab(&r, base - 0.1, base, FaceMats::all(Material::Lawn)),
+            AreaKind::Street => set.slab(
+                &r,
+                base - 0.2,
+                base + 0.05,
+                FaceMats::with_top(Material::Stone, Material::Basalt),
+            ),
+            AreaKind::Road => set.slab(&r, base - 0.1, base + 0.03, FaceMats::all(Material::Earth)),
+            AreaKind::Piazza => {
+                let low = self
+                    .layout
+                    .terrain
+                    .as_ref()
+                    .map_or(base - 0.2, |t| t.range_in(&r).0 - 0.3);
+                set.slab(
+                    &r,
+                    low.min(base - 0.2),
+                    base + 0.05,
+                    FaceMats::with_top(Material::Stone, Material::Slabs),
+                );
+            }
+            AreaKind::Platform => {
+                // Rises `height` above its ground, and reaches down to the lowest terrain beneath it.
+                let top = base + a.height;
+                let low = self
+                    .layout
+                    .terrain
+                    .as_ref()
+                    .map_or(base - 0.05, |t| t.range_in(&r).0 - 0.4);
+                if top - low > 0.15 {
+                    set.slab(
+                        &r,
+                        low,
+                        top,
+                        FaceMats::with_top(Material::Rustication, Material::Stone),
+                    );
+                }
+            }
+            AreaKind::Courtyard => self.courtyard(set, a, base),
+            AreaKind::Parterre => parterre(set, &r, base, a.height, part.id),
+            AreaKind::Vineyard => {
+                set.slab(&r, base - 0.1, base + 0.02, FaceMats::all(Material::Earth));
+                vines(set, &r, a.height, &|_| base + 0.02);
+            }
+            AreaKind::Tower => tower(set, &r, base, a.height, style.roof_pitch_deg),
             AreaKind::Path => set.slab(
                 &r,
                 base,
@@ -979,6 +1242,159 @@ impl<'a> Scene<'a> {
                 }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn gate(
+        &self,
+        set: &mut MeshSet,
+        part: &Part,
+        o: &OpeningPart,
+        frame: &Frame,
+        centre: f64,
+        half: f64,
+        base: f64,
+    ) {
+        gate_mesh(
+            set,
+            frame,
+            centre - o.width / 2.0,
+            centre + o.width / 2.0,
+            base,
+            o.height,
+            half,
+            part.id,
+        );
+    }
+
+    /// A paved courtyard ringed by a portico: columns and arches round a covered walk.
+    fn courtyard(&self, set: &mut MeshSet, a: &AreaPart, base: f64) {
+        let r = a.rect;
+        set.slab(
+            &r,
+            base,
+            base + 0.08,
+            FaceMats::with_top(Material::Stone, Material::Slabs),
+        );
+        let inner = r.grow(-crate::generate::PORTICO_DEPTH);
+        if inner.w < 2.0 || inner.d < 2.0 {
+            return;
+        }
+        let spring = base + 2.7;
+        // Corners clockwise seen from above, so each arcade faces out towards the covered walk.
+        let corners = [
+            [inner.x, inner.z],
+            [inner.x, inner.z1()],
+            [inner.x1(), inner.z1()],
+            [inner.x1(), inner.z],
+        ];
+        let edges: Vec<(P2, P2)> = (0..4).map(|i| (corners[i], corners[(i + 1) % 4])).collect();
+        let max_bay = edges
+            .iter()
+            .map(|(p, q)| bay_width(dist(*p, *q)))
+            .fold(0.0, f64::max);
+        let top = (base + a.height - 0.2).max(spring + max_bay / 2.0 + 0.4);
+        for edge in &edges {
+            arcade(set, *edge, spring, top, base + 0.08, true, true);
+        }
+        for walk in r.subtract(&inner.grow(-0.2)) {
+            set.slab(
+                &walk,
+                top,
+                top + 0.22,
+                FaceMats::with_top(Material::Stone, Material::Cotto),
+            );
+        }
+    }
+
+    /// A ground covering laid over the terrain.
+    fn drape(&self, set: &mut MeshSet, a: &AreaPart, terrain: &crate::terrain::Terrain) {
+        let (material, lift) = match a.kind {
+            AreaKind::Lawn => return, // the terrain is already grass
+            AreaKind::Street => (Material::Basalt, 0.07),
+            AreaKind::Terrace => (Material::Slabs, 0.03),
+            AreaKind::Path => (Material::Gravel, 0.05),
+            _ => (Material::Earth, 0.04),
+        };
+        let r = a.rect;
+        let (sx, sz) = terrain.spacing();
+        let nx = ((r.w / sx.max(1.0)).ceil() as usize).clamp(1, 200);
+        let nz = ((r.d / sz.max(1.0)).ceil() as usize).clamp(1, 200);
+        let h = |x: f64, z: f64| terrain.height_at([x, z]) + lift;
+        for i in 0..nx {
+            for j in 0..nz {
+                let (x0, x1) = (
+                    r.x + r.w * i as f64 / nx as f64,
+                    r.x + r.w * (i + 1) as f64 / nx as f64,
+                );
+                let (z0, z1) = (
+                    r.z + r.d * j as f64 / nz as f64,
+                    r.z + r.d * (j + 1) as f64 / nz as f64,
+                );
+                let quad = [
+                    v3(x0, h(x0, z0), z0),
+                    v3(x1, h(x1, z0), z0),
+                    v3(x1, h(x1, z1), z1),
+                    v3(x0, h(x0, z1), z1),
+                ];
+                set.polygon(material, &[quad[0], quad[1], quad[2]], V3::UP);
+                set.polygon(material, &[quad[0], quad[2], quad[3]], V3::UP);
+            }
+        }
+        if a.kind == AreaKind::Vineyard {
+            vines(set, &r, a.height, &|p| terrain.height_at(p));
+        }
+    }
+
+    /// The ground itself: grass, with bare earth where it is steep.
+    pub fn build_terrain(&self) -> MeshSet {
+        let mut set = MeshSet::default();
+        let Some(t) = &self.layout.terrain else {
+            return set;
+        };
+        let at = |i: usize, j: usize| {
+            let p = t.point(i, j);
+            v3(p[0], t.get(i, j), p[1])
+        };
+        for j in 0..t.rows {
+            for i in 0..t.cols {
+                let quad = [at(i, j), at(i + 1, j), at(i + 1, j + 1), at(i, j + 1)];
+                for tri in [[quad[0], quad[1], quad[2]], [quad[0], quad[2], quad[3]]] {
+                    let n = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalized();
+                    let material = if n.y.abs() < 0.8 {
+                        Material::Earth
+                    } else {
+                        Material::Lawn
+                    };
+                    set.polygon(material, &tri, V3::UP);
+                }
+            }
+        }
+        set
+    }
+
+    /// Every building group on `level`, meshed separately so each can wear its own colours.
+    pub fn build_level_groups(&self, level: u32, view: &View) -> Vec<(Option<u32>, MeshSet)> {
+        let mut groups: Vec<(Option<u32>, MeshSet)> = Vec::new();
+        let slot = |groups: &mut Vec<(Option<u32>, MeshSet)>, g: Option<u32>| match groups
+            .iter()
+            .position(|(k, _)| *k == g)
+        {
+            Some(i) => i,
+            None => {
+                groups.push((g, MeshSet::default()));
+                groups.len() - 1
+            }
+        };
+        for part in self.layout.on_level(level) {
+            let i = slot(&mut groups, part.group);
+            self.part_into(&mut groups[i].1, part, view);
+        }
+        for post in self.posts.iter().filter(|p| p.level == level) {
+            let i = slot(&mut groups, post.group);
+            self.post_into(&mut groups[i].1, post, view);
+        }
+        groups
     }
 
     fn pergola(&self, set: &mut MeshSet, part: &Part, a: &AreaPart, base: f64) {
@@ -1080,7 +1496,7 @@ impl<'a> Scene<'a> {
         );
         let corners = [[r.x, r.z], [r.x1(), r.z], [r.x1(), r.z1()], [r.x, r.z1()]];
         let edges: Vec<(P2, P2)> = (0..4).map(|i| (corners[i], corners[(i + 1) % 4])).collect();
-        let attached = self.centroids.get(&part.level).and_then(|c| {
+        let attached = self.centroids.get(&(part.group, part.level)).and_then(|c| {
             (0..4).min_by(|&i, &j| {
                 let mid = |k: usize| {
                     [
@@ -1113,7 +1529,7 @@ impl<'a> Scene<'a> {
     }
 
     fn prop(&self, set: &mut MeshSet, part: &Part, p: &PropPart) {
-        let base = V3::ground(p.at, self.layout.elevation(part.level));
+        let base = V3::ground(p.at, self.layout.base(part));
         let s = p.scale.max(0.05);
         let h = p.height.max(0.1);
         let seed = part.id;
@@ -1272,6 +1688,129 @@ impl<'a> Scene<'a> {
                 }
             }
             PropKind::Column => column(set, base, h, 0.2 * s),
+            PropKind::Well => {
+                let rim: Vec<(f64, f64)> = [
+                    (0.7, 0.0),
+                    (0.7, 0.85),
+                    (0.76, 0.9),
+                    (0.76, 0.98),
+                    (0.6, 0.98),
+                    (0.6, 0.25),
+                    (0.0, 0.25),
+                ]
+                .iter()
+                .map(|&(r, y)| (r * s, y))
+                .collect();
+                set.lathe(Material::Stone, base, &rim, 14, true);
+                disc(set, Material::Water, base + V3::UP * 0.6, 0.6 * s, 12);
+                let left = base + v3(-0.65 * s, 0.95, 0.0);
+                let right = base + v3(0.65 * s, 0.95, 0.0);
+                set.cylinder(Material::Iron, left, left + V3::UP * (h - 1.35), 0.03, 5);
+                set.cylinder(Material::Iron, right, right + V3::UP * (h - 1.35), 0.03, 5);
+                let arc: Vec<V3> = (0..=8)
+                    .map(|k| {
+                        let a = PI * k as f64 / 8.0;
+                        base + v3(-0.65 * s * a.cos(), h - 0.4 + 0.35 * a.sin(), 0.0)
+                    })
+                    .collect();
+                for pair in arc.windows(2) {
+                    set.cylinder(Material::Iron, pair[0], pair[1], 0.025, 4);
+                }
+                set.icosphere(
+                    Material::Iron,
+                    base + V3::UP * (h - 0.25),
+                    v3(0.09, 0.09, 0.09),
+                    0,
+                    0.0,
+                    seed,
+                );
+            }
+            PropKind::Urn => {
+                let stone = FaceMats::all(Material::Stone);
+                let w = 0.25 * s;
+                let ped = (h * 0.55).max(0.4);
+                set.cuboid(
+                    &Frame::WORLD,
+                    (base.x - w, base.x + w),
+                    (base.y, base.y + ped),
+                    (base.z - w, base.z + w),
+                    stone,
+                );
+                set.cuboid(
+                    &Frame::WORLD,
+                    (base.x - w - 0.04, base.x + w + 0.04),
+                    (base.y + ped, base.y + ped + 0.06),
+                    (base.z - w - 0.04, base.z + w + 0.04),
+                    stone,
+                );
+                let urn = h - ped - 0.06;
+                let profile: Vec<(f64, f64)> = [
+                    (0.1, 0.0),
+                    (0.16, 0.1),
+                    (0.28, 0.35),
+                    (0.3, 0.55),
+                    (0.2, 0.78),
+                    (0.25, 0.86),
+                    (0.0, 1.0),
+                ]
+                .iter()
+                .map(|&(r, y)| (r * s, y * urn))
+                .collect();
+                set.lathe(
+                    Material::Stone,
+                    base + V3::UP * (ped + 0.06),
+                    &profile,
+                    12,
+                    true,
+                );
+            }
+            PropKind::StonePine => {
+                let crown = base + v3(0.3 * s, h * 0.78, 0.2 * s);
+                set.cylinder(Material::Wood, base, crown, 0.22 * s, 7);
+                let r = 2.4 * s;
+                set.icosphere(
+                    Material::CypressLeaf,
+                    crown + V3::UP * 0.5,
+                    v3(r, 0.9 * s.sqrt(), r * 0.9),
+                    1,
+                    0.25,
+                    seed,
+                );
+                for k in 0..3 {
+                    let off = v3(jitter(k, 0) * r, 0.2 + jitter(k, 1) * 0.4, jitter(k, 2) * r);
+                    set.icosphere(
+                        Material::CypressLeaf,
+                        crown + off + V3::UP * 0.6,
+                        v3(r * 0.55, 0.6, r * 0.5),
+                        1,
+                        0.3,
+                        seed + k,
+                    );
+                }
+            }
+            PropKind::Palm => {
+                let crown = base + v3(0.15 * s, h * 0.85, 0.0);
+                let rings = 6;
+                for k in 0..rings {
+                    let a = base.lerp(crown, k as f64 / rings as f64);
+                    let b = base.lerp(crown, (k + 1) as f64 / rings as f64);
+                    set.cylinder(Material::Wood, a, b, 0.2 * s - 0.01 * k as f64, 6);
+                }
+                for k in 0..10 {
+                    let angle = PI * 2.0 * k as f64 / 10.0 + jitter(k, 0);
+                    let dir = v3(angle.cos(), 0.0, angle.sin());
+                    let side = v3(-dir.z, 0.0, dir.x) * (0.22 * s);
+                    let tip = crown + dir * (1.9 * s) - V3::UP * (0.7 + jitter(k, 1) * 0.4);
+                    let mid = crown + dir * (1.0 * s) + V3::UP * 0.25;
+                    for facing in [V3::UP, -V3::UP] {
+                        set.polygon(
+                            Material::Foliage,
+                            &[crown, mid + side, tip, mid - side],
+                            facing,
+                        );
+                    }
+                }
+            }
             PropKind::Lamp => {
                 let y = base.y;
                 let iron = FaceMats::all(Material::Iron);
@@ -1334,6 +1873,234 @@ fn wall_with_holes(
     if end > cursor {
         set.cuboid(f, (cursor, end), (y0, y1), n, mats);
     }
+}
+
+/// Square stone piers with ball finials, and an iron gate between them.
+#[allow(clippy::too_many_arguments)]
+fn gate_mesh(
+    set: &mut MeshSet,
+    frame: &Frame,
+    u0: f64,
+    u1: f64,
+    base: f64,
+    height: f64,
+    half: f64,
+    seed: u64,
+) {
+    let stone = FaceMats::all(Material::Stone);
+    let iron = FaceMats::all(Material::Iron);
+    let pier = 0.55;
+    let top = base + height + 0.35;
+    for (a, b) in [(u0 - pier, u0), (u1, u1 + pier)] {
+        set.cuboid(
+            frame,
+            (a, b),
+            (base, top),
+            (-half - 0.06, half + 0.06),
+            stone,
+        );
+        set.cuboid(
+            frame,
+            (a - 0.05, b + 0.05),
+            (top, top + 0.1),
+            (-half - 0.11, half + 0.11),
+            stone,
+        );
+        let c = frame.at((a + b) / 2.0, top + 0.3, 0.0);
+        set.cylinder(
+            Material::Stone,
+            frame.at((a + b) / 2.0, top + 0.1, 0.0),
+            c,
+            0.07,
+            6,
+        );
+        set.icosphere(Material::Stone, c, v3(0.2, 0.2, 0.2), 1, 0.0, seed);
+    }
+    let mut u = u0 + 0.06;
+    while u < u1 - 0.05 {
+        set.cuboid(
+            frame,
+            (u - 0.015, u + 0.015),
+            (base + 0.06, base + height - 0.05),
+            (-0.015, 0.015),
+            iron,
+        );
+        u += 0.12;
+    }
+    for v in [base + 0.08, base + height * 0.5, base + height - 0.08] {
+        set.cuboid(
+            frame,
+            (u0 + 0.02, u1 - 0.02),
+            (v - 0.03, v + 0.03),
+            (-0.025, 0.025),
+            iron,
+        );
+    }
+}
+
+/// A projecting stone ledge over a window, crowned by a triangular pediment or a second ledge.
+fn pediment(set: &mut MeshSet, f: &Frame, u0: f64, u1: f64, v: f64, half: f64, triangular: bool) {
+    let stone = FaceMats::all(Material::Stone);
+    set.cuboid(f, (u0, u1), (v, v + 0.09), (half, half + 0.13), stone);
+    let mid = (u0 + u1) / 2.0;
+    let v0 = v + 0.09;
+    if triangular {
+        let apex = v0 + (u1 - u0) * 0.22;
+        let (front, back) = (half + 0.11, half);
+        let (a, b) = (u0 + 0.04, u1 - 0.04);
+        set.polygon(
+            Material::Stone,
+            &[
+                f.at(a, v0, front),
+                f.at(b, v0, front),
+                f.at(mid, apex, front),
+            ],
+            f.n,
+        );
+        let up_left = f.v * (mid - a) - f.u * (apex - v0);
+        let up_right = f.v * (b - mid) + f.u * (apex - v0);
+        set.polygon(
+            Material::Stone,
+            &[
+                f.at(a, v0, front),
+                f.at(mid, apex, front),
+                f.at(mid, apex, back),
+                f.at(a, v0, back),
+            ],
+            up_left,
+        );
+        set.polygon(
+            Material::Stone,
+            &[
+                f.at(mid, apex, front),
+                f.at(b, v0, front),
+                f.at(b, v0, back),
+                f.at(mid, apex, back),
+            ],
+            up_right,
+        );
+    } else {
+        set.cuboid(
+            f,
+            (u0 + 0.08, u1 - 0.08),
+            (v0, v0 + 0.07),
+            (half, half + 0.09),
+            stone,
+        );
+    }
+}
+
+/// Box-hedge beds in four quarters around a gravel cross, with topiary balls.
+fn parterre(set: &mut MeshSet, r: &Rect, base: f64, height: f64, seed: u64) {
+    set.slab(r, base, base + 0.03, FaceMats::all(Material::Gravel));
+    let hedge = FaceMats::all(Material::Foliage);
+    let path = 1.2;
+    let (cx, cz) = r.center();
+    let beds = [
+        Rect::new(r.x, r.z, cx - path / 2.0 - r.x, cz - path / 2.0 - r.z),
+        Rect::new(
+            cx + path / 2.0,
+            r.z,
+            r.x1() - cx - path / 2.0,
+            cz - path / 2.0 - r.z,
+        ),
+        Rect::new(
+            r.x,
+            cz + path / 2.0,
+            cx - path / 2.0 - r.x,
+            r.z1() - cz - path / 2.0,
+        ),
+        Rect::new(
+            cx + path / 2.0,
+            cz + path / 2.0,
+            r.x1() - cx - path / 2.0,
+            r.z1() - cz - path / 2.0,
+        ),
+    ];
+    for (k, bed) in beds.iter().enumerate() {
+        if bed.w < 0.8 || bed.d < 0.8 {
+            continue;
+        }
+        let t = 0.3;
+        for band in [
+            Rect::new(bed.x, bed.z, bed.w, t),
+            Rect::new(bed.x, bed.z1() - t, bed.w, t),
+            Rect::new(bed.x, bed.z + t, t, bed.d - 2.0 * t),
+            Rect::new(bed.x1() - t, bed.z + t, t, bed.d - 2.0 * t),
+        ] {
+            set.slab(&band, base, base + height, hedge);
+        }
+        let inner = bed.grow(-t);
+        if inner.w > 0.2 && inner.d > 0.2 {
+            set.slab(&inner, base, base + 0.06, FaceMats::all(Material::Lawn));
+        }
+        let (bx, bz) = bed.center();
+        set.icosphere(
+            Material::Foliage,
+            v3(bx, base + height + 0.35, bz),
+            v3(0.4, 0.45, 0.4),
+            1,
+            0.1,
+            seed + k as u64,
+        );
+    }
+}
+
+/// Rows of vines on wooden posts, following `ground`.
+fn vines(set: &mut MeshSet, r: &Rect, height: f64, ground: &dyn Fn(P2) -> f64) {
+    let mut z = r.z + 1.0;
+    while z < r.z1() - 0.5 {
+        let mut x = r.x + 0.5;
+        while x < r.x1() - 0.5 {
+            let x1 = (x + 4.0).min(r.x1() - 0.5);
+            let (g0, g1) = (ground([x, z]), ground([x1, z]));
+            let g = g0.min(g1);
+            set.cylinder(
+                Material::Wood,
+                v3(x, g0 - 0.1, z),
+                v3(x, g0 + height, z),
+                0.04,
+                4,
+            );
+            set.cuboid(
+                &Frame::WORLD,
+                (x, x1),
+                (g + 0.55, g0.max(g1) + height),
+                (z - 0.22, z + 0.22),
+                FaceMats::all(Material::Foliage),
+            );
+            x = x1;
+        }
+        z += 2.2;
+    }
+}
+
+/// A square belvedere tower: a plastered shaft with stone corners and an open loggia on top.
+fn tower(set: &mut MeshSet, r: &Rect, base: f64, height: f64, pitch: f64) {
+    let shaft_top = base + (height - 3.4).max(2.0);
+    set.slab(
+        r,
+        base,
+        shaft_top,
+        FaceMats::with_top(Material::Plaster, Material::Cotto),
+    );
+    let stone = FaceMats::all(Material::Stone);
+    let q = 0.35;
+    let piers = [
+        Rect::new(r.x - 0.03, r.z - 0.03, q, q),
+        Rect::new(r.x1() - q + 0.03, r.z - 0.03, q, q),
+        Rect::new(r.x - 0.03, r.z1() - q + 0.03, q, q),
+        Rect::new(r.x1() - q + 0.03, r.z1() - q + 0.03, q, q),
+    ];
+    for p in &piers {
+        set.slab(p, base, shaft_top + 2.7, stone);
+    }
+    set.slab(&r.grow(0.08), shaft_top - 0.15, shaft_top, stone);
+    let roof_base = shaft_top + 2.7;
+    set.slab(&r.grow(0.1), roof_base, roof_base + 0.2, stone);
+    let eaves = r.grow(0.45);
+    let rise = eaves.w.min(eaves.d) / 2.0 * pitch.to_radians().tan();
+    hip_roof(set, &eaves, roof_base + 0.2, rise);
 }
 
 /// Fills the corners above a round arch and lines its curved soffit.
@@ -1527,6 +2294,37 @@ fn hip_roof(set: &mut MeshSet, e: &Rect, y: f64, rise: f64) {
         (v3(e.x1(), y, e.z1()), ridge.1),
     ] {
         set.cylinder(Material::RoofTile, corner + lift, end + lift, 0.08, 6);
+    }
+}
+
+/// A stone balustrade along a strip: a plinth, turned balusters and a handrail.
+fn balustrade_band(set: &mut MeshSet, band: &Rect, y: f64, height: f64) {
+    let stone = FaceMats::all(Material::Stone);
+    set.slab(band, y, y + 0.14, stone);
+    set.slab(&band.grow(0.02), y + height - 0.1, y + height, stone);
+    let h = height - 0.24;
+    let profile: Vec<(f64, f64)> = [
+        (0.05, 0.0),
+        (0.04, 0.15),
+        (0.08, 0.42),
+        (0.035, 0.8),
+        (0.05, 1.0),
+    ]
+    .iter()
+    .map(|&(r, v)| (r, v * h))
+    .collect();
+    let along_x = band.w >= band.d;
+    let len = if along_x { band.w } else { band.d };
+    let count = ((len - 0.2) / 0.3).floor().max(1.0) as usize;
+    let (cx, cz) = band.center();
+    for k in 0..=count {
+        let t = 0.1 + (len - 0.2) * k as f64 / count as f64;
+        let p = if along_x {
+            v3(band.x + t, y + 0.14, cz)
+        } else {
+            v3(cx, y + 0.14, band.z + t)
+        };
+        set.lathe(Material::Stone, p, &profile, 5, true);
     }
 }
 

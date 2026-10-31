@@ -1,4 +1,4 @@
-//! The 3D view: textured materials, building meshes per level, camera and sunlight.
+//! The 3D view: textured materials, meshes per level and building, the terrain, camera and sun.
 
 use std::collections::HashMap;
 
@@ -10,9 +10,10 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, PrimitiveTopology, TextureDimension, TextureFormat};
 use bevy::render::view::Msaa;
 use bevy_panorbit_camera::PanOrbitCamera;
-use urbanitas::mesh::build::{Scene, View};
+use urbanitas::mesh::build::{Scene, View, WallMode};
 use urbanitas::mesh::{Material, MeshData, MeshSet};
 use urbanitas::style::Palette;
+use urbanitas::terrain::Terrain;
 use urbanitas::texture;
 
 use crate::project::{Mode, Project, Quality};
@@ -33,16 +34,30 @@ impl Plugin for ScenePlugin {
             .add_systems(Startup, setup)
             .add_systems(
                 Update,
-                (track_camera_look, rebuild, level_visibility, apply_quality).chain(),
+                (
+                    track_camera_look,
+                    rebuild,
+                    rebuild_terrain,
+                    level_visibility,
+                    apply_quality,
+                )
+                    .chain(),
             );
     }
 }
 
-/// A mesh belonging to one level of the building.
+/// The camera you look through (as opposed to the cameras that paint catalogue pictures).
+#[derive(Component)]
+pub struct MainCamera;
+
+/// A mesh belonging to one level.
 #[derive(Component)]
 pub struct LevelMesh {
     pub level: u32,
 }
+
+#[derive(Component)]
+pub struct TerrainMesh;
 
 #[derive(Component)]
 pub struct Sun;
@@ -57,36 +72,20 @@ pub struct CameraLook {
 #[derive(Resource, Default)]
 pub struct SceneStats {
     per_level: HashMap<u32, usize>,
+    terrain: usize,
     pub build_ms: f64,
 }
 
 impl SceneStats {
     pub fn triangles(&self) -> usize {
-        self.per_level.values().sum()
+        self.per_level.values().sum::<usize>() + self.terrain
     }
 }
 
 #[derive(Resource, Default)]
 pub struct MaterialCache {
     materials: HashMap<(Material, String, u32), Handle<StandardMaterial>>,
-}
-
-/// Only these materials take the palette's colours; the rest are shared by every building.
-fn palette_key(material: Material, palette: &Palette) -> String {
-    match material {
-        Material::Plaster
-        | Material::Rustication
-        | Material::Stone
-        | Material::Shutter
-        | Material::Door
-        | Material::RoofTile => {
-            format!(
-                "{:?}",
-                (palette.walls, palette.trim, palette.roof, palette.stone)
-            )
-        }
-        _ => String::new(),
-    }
+    terrain: Option<(u32, Handle<StandardMaterial>)>,
 }
 
 impl MaterialCache {
@@ -99,9 +98,17 @@ impl MaterialCache {
         materials: &mut Assets<StandardMaterial>,
     ) -> Handle<StandardMaterial> {
         let size = quality.texture_size();
-        let key = (material, palette_key(material, palette), size);
+        // Only some materials take the palette's colours; the rest are shared by every building.
+        let tint = if material.uses_palette() {
+            format!(
+                "{:?}",
+                (palette.walls, palette.trim, palette.roof, palette.stone)
+            )
+        } else {
+            String::new()
+        };
         self.materials
-            .entry(key)
+            .entry((material, tint, size))
             .or_insert_with(|| {
                 let tex = texture::generate(material, palette, size);
                 let image = images.add(make_image(&tex, quality));
@@ -120,9 +127,35 @@ impl MaterialCache {
             })
             .clone()
     }
+
+    /// Grass whose colour is multiplied by the terrain's vertex colours.
+    fn terrain(
+        &mut self,
+        palette: &Palette,
+        quality: Quality,
+        images: &mut Assets<Image>,
+        materials: &mut Assets<StandardMaterial>,
+    ) -> Handle<StandardMaterial> {
+        let size = quality.texture_size();
+        if let Some((s, handle)) = &self.terrain {
+            if *s == size {
+                return handle.clone();
+            }
+        }
+        let tex = texture::generate(Material::Lawn, palette, size);
+        let image = images.add(make_image(&tex, quality));
+        let handle = materials.add(StandardMaterial {
+            base_color_texture: Some(image),
+            perceptual_roughness: 0.95,
+            reflectance: 0.2,
+            ..default()
+        });
+        self.terrain = Some((size, handle.clone()));
+        handle
+    }
 }
 
-fn make_image(tex: &texture::Texture, quality: Quality) -> Image {
+pub fn make_image(tex: &texture::Texture, quality: Quality) -> Image {
     let size = Extent3d {
         width: tex.size,
         height: tex.size,
@@ -170,6 +203,67 @@ pub fn merged(set: &MeshSet) -> MeshData {
     out
 }
 
+/// A smooth grid over the height map, every `stride` points, tinted towards bare earth where steep.
+pub fn terrain_mesh(t: &Terrain, stride: usize) -> (Mesh, usize) {
+    let stride = stride.max(1);
+    let xs: Vec<usize> = (0..=t.cols)
+        .step_by(stride)
+        .chain((!t.cols.is_multiple_of(stride)).then_some(t.cols))
+        .collect();
+    let zs: Vec<usize> = (0..=t.rows)
+        .step_by(stride)
+        .chain((!t.rows.is_multiple_of(stride)).then_some(t.rows))
+        .collect();
+    let (nx, nz) = (xs.len(), zs.len());
+    let mut positions = Vec::with_capacity(nx * nz);
+    let mut normals = Vec::with_capacity(nx * nz);
+    let mut uvs = Vec::with_capacity(nx * nz);
+    let mut colors = Vec::with_capacity(nx * nz);
+    let h = |i: usize, j: usize| t.get(i.min(t.cols), j.min(t.rows));
+    let (sx, sz) = t.spacing();
+    for &j in &zs {
+        for &i in &xs {
+            let p = t.point(i, j);
+            let y = h(i, j);
+            let dx = (h(i + 1, j) - h(i.saturating_sub(1), j)) / (2.0 * sx);
+            let dz = (h(i, j + 1) - h(i, j.saturating_sub(1))) / (2.0 * sz);
+            let n = Vec3::new(-dx as f32, 1.0, -dz as f32).normalize();
+            positions.push([p[0] as f32, y as f32, p[1] as f32]);
+            normals.push(n.to_array());
+            uvs.push([p[0] as f32 / 2.0, -(p[1] as f32) / 2.0]);
+            // Steeper ground shows dry earth through the grass.
+            let steep = ((1.0 - n.y) * 4.0).clamp(0.0, 1.0);
+            colors.push([
+                1.0 - 0.0 * steep,
+                1.0 - 0.18 * steep,
+                1.0 - 0.45 * steep,
+                1.0,
+            ]);
+        }
+    }
+    let mut indices = Vec::with_capacity((nx - 1) * (nz - 1) * 6);
+    for j in 0..nz - 1 {
+        for i in 0..nx - 1 {
+            let a = (j * nx + i) as u32;
+            let b = a + 1;
+            let c = a + nx as u32;
+            let d = c + 1;
+            indices.extend([a, c, b, b, c, d]);
+        }
+    }
+    let triangles = indices.len() / 3;
+    let mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+    .with_inserted_indices(Indices::U32(indices));
+    (mesh, triangles)
+}
+
 /// Where the camera starts: angles in radians and a multiplier on the framing distance.
 #[derive(Resource, Clone, Copy)]
 pub struct CameraStart {
@@ -189,24 +283,35 @@ impl Default for CameraStart {
     }
 }
 
-fn setup(mut commands: Commands, project: Res<Project>, start: Option<Res<CameraStart>>) {
-    let start = start.map(|s| *s).unwrap_or_default();
+/// A camera framing that takes in the whole layout.
+pub fn framing(project: &Project) -> (Vec3, f32) {
     let bounds = project.layout.bounds();
     let (cx, cz) = bounds.center();
-    let radius = (bounds.w.max(bounds.d) * 1.25).max(18.0) as f32 * start.zoom;
+    let ground = project.layout.ground_at([cx, cz]) as f32;
+    let span = bounds.w.max(bounds.d) as f32;
+    (
+        Vec3::new(cx as f32, ground + 3.0, cz as f32),
+        (span * 1.25).clamp(20.0, 360.0),
+    )
+}
+
+fn setup(mut commands: Commands, project: Res<Project>, start: Option<Res<CameraStart>>) {
+    let start = start.map(|s| *s).unwrap_or_default();
+    let (focus, radius) = framing(&project);
     commands.spawn((
+        MainCamera,
         Camera3d::default(),
         Msaa::Sample4,
         PanOrbitCamera {
-            focus: Vec3::new(cx as f32, 3.0, cz as f32),
-            radius: Some(radius),
+            focus,
+            radius: Some(radius * start.zoom),
             yaw: Some(start.yaw),
             pitch: Some(start.pitch),
             button_orbit: MouseButton::Right,
             button_pan: MouseButton::Middle,
             pitch_lower_limit: Some(0.05),
             zoom_lower_limit: 3.0,
-            zoom_upper_limit: Some(250.0),
+            zoom_upper_limit: Some(450.0),
             ..default()
         },
     ));
@@ -222,8 +327,8 @@ fn setup(mut commands: Commands, project: Res<Project>, start: Option<Res<Camera
         Transform::from_xyz(25.0, 45.0, -35.0).looking_at(Vec3::ZERO, Vec3::Y),
         CascadeShadowConfigBuilder {
             num_cascades: 2,
-            first_cascade_far_bound: 25.0,
-            maximum_distance: 120.0,
+            first_cascade_far_bound: 30.0,
+            maximum_distance: 200.0,
             ..default()
         }
         .build(),
@@ -241,7 +346,7 @@ fn setup(mut commands: Commands, project: Res<Project>, start: Option<Res<Camera
 }
 
 fn track_camera_look(
-    camera: Query<&GlobalTransform, With<Camera3d>>,
+    camera: Query<&GlobalTransform, With<MainCamera>>,
     mut look: ResMut<CameraLook>,
     mut project: ResMut<Project>,
 ) {
@@ -259,8 +364,7 @@ fn track_camera_look(
         let angle = octant as f64 * std::f64::consts::FRAC_PI_4;
         look.octant = Some(octant);
         look.dir = Some([angle.cos(), angle.sin()]);
-        if project.mode == Mode::Build && project.walls == urbanitas::mesh::build::WallMode::Cutaway
-        {
+        if project.mode == Mode::Build && project.walls == WallMode::Cutaway {
             let level = project.level;
             project.mark(&[level]);
         }
@@ -303,28 +407,65 @@ fn rebuild(
         } else {
             View::default()
         };
-        let set = scene.build_level(level, &view);
-        stats.per_level.insert(level, set.triangle_count());
-        for (material, data) in &set.meshes {
-            if data.is_empty() {
-                continue;
+        let mut triangles = 0;
+        for (group, set) in scene.build_level_groups(level, &view) {
+            triangles += set.triangle_count();
+            let palette = project.layout.palette_of(group).clone();
+            for (material, data) in &set.meshes {
+                if data.is_empty() {
+                    continue;
+                }
+                let handle = cache.get(
+                    *material,
+                    &palette,
+                    project.quality,
+                    &mut images,
+                    &mut materials,
+                );
+                commands.spawn((
+                    Mesh3d(meshes.add(bevy_mesh(data))),
+                    MeshMaterial3d(handle),
+                    Transform::default(),
+                    LevelMesh { level },
+                ));
             }
-            let handle = cache.get(
-                *material,
-                &project.layout.palette,
-                project.quality,
-                &mut images,
-                &mut materials,
-            );
-            commands.spawn((
-                Mesh3d(meshes.add(bevy_mesh(data))),
-                MeshMaterial3d(handle),
-                Transform::default(),
-                LevelMesh { level },
-            ));
         }
+        stats.per_level.insert(level, triangles);
     }
     stats.build_ms = started.elapsed().as_secs_f64() * 1000.0;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rebuild_terrain(
+    mut commands: Commands,
+    mut project: ResMut<Project>,
+    mut cache: ResMut<MaterialCache>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut images: ResMut<Assets<Image>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    existing: Query<Entity, With<TerrainMesh>>,
+    mut stats: ResMut<SceneStats>,
+) {
+    if !project.take_terrain_dirty() {
+        return;
+    }
+    for entity in &existing {
+        commands.entity(entity).despawn();
+    }
+    stats.terrain = 0;
+    let Some(terrain) = &project.layout.terrain else {
+        return;
+    };
+    let (mesh, triangles) = terrain_mesh(terrain, project.quality.terrain_stride());
+    stats.terrain = triangles;
+    let palette = project.layout.palette.clone();
+    let handle = cache.terrain(&palette, project.quality, &mut images, &mut materials);
+    commands.spawn((
+        TerrainMesh,
+        Mesh3d(meshes.add(mesh)),
+        MeshMaterial3d(handle),
+        Transform::default(),
+    ));
 }
 
 fn level_visibility(project: Res<Project>, mut meshes: Query<(&LevelMesh, &mut Visibility)>) {
@@ -343,7 +484,7 @@ fn level_visibility(project: Res<Project>, mut meshes: Query<(&LevelMesh, &mut V
 
 fn apply_quality(
     project: Res<Project>,
-    mut cameras: Query<&mut Msaa, With<Camera3d>>,
+    mut cameras: Query<&mut Msaa, With<MainCamera>>,
     mut suns: Query<&mut DirectionalLight, With<Sun>>,
     mut last: Local<Option<Quality>>,
 ) {

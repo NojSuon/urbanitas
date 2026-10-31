@@ -16,17 +16,41 @@ use crate::mesh::build::{Scene, View};
 use crate::parts::{Layout, Part, PartKind};
 use crate::texture;
 
+/// A material as worn by one building: tinted materials take the building's palette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Skin {
+    pub material: Material,
+    /// The building whose palette tints it; `None` for the default palette or untinted materials.
+    pub group: Option<u32>,
+}
+
+impl Skin {
+    fn new(material: Material, group: Option<u32>) -> Self {
+        Self {
+            material,
+            group: group.filter(|_| material.uses_palette()),
+        }
+    }
+
+    pub fn name(&self) -> String {
+        match self.group {
+            Some(g) => format!("{}_b{g}", self.material.name()),
+            None => self.material.name().to_string(),
+        }
+    }
+}
+
 /// The text of an `.obj` file and the `.mtl` file it references.
 pub struct ObjExport {
     pub obj: String,
     pub mtl: String,
-    /// Materials the model uses; each needs its texture written as `texture_file(prefix, material)`.
-    pub materials: Vec<Material>,
+    /// Materials the model uses; each needs its texture written as `texture_file(prefix, skin)`.
+    pub skins: Vec<Skin>,
 }
 
 /// File name of a material's texture, next to the OBJ.
-pub fn texture_file(prefix: &str, material: Material) -> String {
-    format!("{prefix}_{}.png", material.name())
+pub fn texture_file(prefix: &str, skin: &Skin) -> String {
+    format!("{prefix}_{}.png", skin.name())
 }
 
 /// Builds the model. `mtl_name` goes in the `mtllib` line; textures are named after `texture_prefix`.
@@ -38,41 +62,42 @@ pub fn to_obj(layout: &Layout, mtl_name: &str, texture_prefix: &str) -> ObjExpor
     let _ = writeln!(obj, "mtllib {mtl_name}\no {}", layout.name);
     let mut body = String::new();
     let mut base = 1usize;
-    let mut used: Vec<Material> = Vec::new();
-    let mut write_set =
-        |name: &str, set: crate::mesh::MeshSet, obj: &mut String, body: &mut String| {
-            for (material, mesh) in &set.meshes {
-                if mesh.is_empty() {
-                    continue;
-                }
-                if !used.contains(material) {
-                    used.push(*material);
-                }
-                for [x, y, z] in &mesh.positions {
-                    let _ = writeln!(obj, "v {x:.4} {y:.4} {z:.4}");
-                }
-                for [u, v] in &mesh.uvs {
-                    let _ = writeln!(obj, "vt {u:.4} {v:.4}");
-                }
-                for [x, y, z] in &mesh.normals {
-                    let _ = writeln!(obj, "vn {x:.4} {y:.4} {z:.4}");
-                }
-                let _ = writeln!(
-                    body,
-                    "g {name}_{}\nusemtl {}",
-                    material.name(),
-                    material.name()
-                );
-                for tri in mesh.indices.chunks(3) {
-                    let [a, b, c] = [0, 1, 2].map(|k| tri[k] as usize + base);
-                    let _ = writeln!(body, "f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}");
-                }
-                base += mesh.positions.len();
+    let mut used: Vec<Skin> = Vec::new();
+    let mut write_set = |name: &str,
+                         group: Option<u32>,
+                         set: crate::mesh::MeshSet,
+                         obj: &mut String,
+                         body: &mut String| {
+        for (material, mesh) in &set.meshes {
+            if mesh.is_empty() {
+                continue;
             }
-        };
+            let skin = Skin::new(*material, group);
+            if !used.contains(&skin) {
+                used.push(skin);
+            }
+            for [x, y, z] in &mesh.positions {
+                let _ = writeln!(obj, "v {x:.4} {y:.4} {z:.4}");
+            }
+            for [u, v] in &mesh.uvs {
+                let _ = writeln!(obj, "vt {u:.4} {v:.4}");
+            }
+            for [x, y, z] in &mesh.normals {
+                let _ = writeln!(obj, "vn {x:.4} {y:.4} {z:.4}");
+            }
+            let _ = writeln!(body, "g {name}_{}\nusemtl {}", material.name(), skin.name());
+            for tri in mesh.indices.chunks(3) {
+                let [a, b, c] = [0, 1, 2].map(|k| tri[k] as usize + base);
+                let _ = writeln!(body, "f {a}/{a}/{a} {b}/{b}/{b} {c}/{c}/{c}");
+            }
+            base += mesh.positions.len();
+        }
+    };
+    write_set("terrain", None, scene.build_terrain(), &mut obj, &mut body);
     for part in &layout.parts {
         write_set(
             &group_name(part),
+            part.group,
             scene.build_part(part, &view),
             &mut obj,
             &mut body,
@@ -80,19 +105,20 @@ pub fn to_obj(layout: &Layout, mtl_name: &str, texture_prefix: &str) -> ObjExpor
     }
     let top = layout.parts.iter().map(|p| p.level).max().unwrap_or(0);
     for level in 0..=top {
-        write_set(
-            &format!("l{level}_corners"),
-            scene.build_posts(level, &view),
-            &mut obj,
-            &mut body,
-        );
+        for (group, set) in scene.build_posts_by_group(level, &view) {
+            let name = match group {
+                Some(g) => format!("b{g}_l{level}_corners"),
+                None => format!("l{level}_corners"),
+            };
+            write_set(&name, group, set, &mut obj, &mut body);
+        }
     }
     obj.push_str(&body);
     used.sort();
     ObjExport {
         obj,
         mtl: materials(&used, texture_prefix),
-        materials: used,
+        skins: used,
     }
 }
 
@@ -115,9 +141,10 @@ pub fn write_obj(layout: &Layout, path: &Path, texture_size: u32) -> io::Result<
     fs::write(&mtl_path, &export.mtl)?;
     let mut written = vec![path.to_path_buf(), mtl_path];
     let dir = path.parent().unwrap_or(Path::new("."));
-    for material in export.materials {
-        let file = dir.join(texture_file(&prefix, material));
-        texture::generate(material, &layout.palette, texture_size).write_png(&file)?;
+    for skin in &export.skins {
+        let file = dir.join(texture_file(&prefix, skin));
+        texture::generate(skin.material, layout.palette_of(skin.group), texture_size)
+            .write_png(&file)?;
         written.push(file);
     }
     Ok(written)
@@ -125,6 +152,7 @@ pub fn write_obj(layout: &Layout, path: &Path, texture_size: u32) -> io::Result<
 
 fn group_name(part: &Part) -> String {
     let kind = match &part.kind {
+        PartKind::Wall(w) if w.finish != crate::parts::WallFinish::Building => "garden_wall",
         PartKind::Wall(w) if w.exterior => "facade",
         PartKind::Wall(_) => "partition",
         PartKind::Opening(_) => "opening",
@@ -135,15 +163,19 @@ fn group_name(part: &Part) -> String {
         PartKind::Area(_) => "area",
         PartKind::Prop(_) => "prop",
     };
-    format!("l{}_{kind}_{}", part.level, part.id)
+    match part.group {
+        Some(g) => format!("b{g}_l{}_{kind}_{}", part.level, part.id),
+        None => format!("l{}_{kind}_{}", part.level, part.id),
+    }
 }
 
-fn materials(used: &[Material], prefix: &str) -> String {
+fn materials(used: &[Skin], prefix: &str) -> String {
     let mut out = String::from("# Urbanitas materials\n# Generated by Urbanitas (Noj Suon)\n");
-    for &material in used {
+    for skin in used {
+        let material = skin.material;
         let (roughness, metallic) = material.surface();
         let shininess = ((1.0 - roughness) * 200.0).max(4.0);
-        let _ = writeln!(out, "\nnewmtl {}", material.name());
+        let _ = writeln!(out, "\nnewmtl {}", skin.name());
         let _ = writeln!(
             out,
             "Ka 0.000 0.000 0.000\nKd 1.000 1.000 1.000\nKs {0:.3} {0:.3} {0:.3}\nNs {shininess:.0}\nillum 2",
@@ -152,7 +184,7 @@ fn materials(used: &[Material], prefix: &str) -> String {
         if material == Material::Water {
             out.push_str("d 0.85\n");
         }
-        let _ = writeln!(out, "map_Kd {}", texture_file(prefix, material));
+        let _ = writeln!(out, "map_Kd {}", texture_file(prefix, skin));
     }
     out
 }

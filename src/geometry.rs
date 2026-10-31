@@ -191,6 +191,170 @@ impl Segment {
     }
 }
 
+/// A straight piece of a building's outline, with the outside on one side of it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Edge {
+    pub seg: Segment,
+    /// +1 when the outside lies towards increasing coordinates on the other axis.
+    pub out: f64,
+}
+
+impl Edge {
+    /// Unit vector pointing out of the building, as `[x, z]`.
+    pub fn outward(&self) -> [f64; 2] {
+        match self.seg.axis {
+            Axis::X => [0.0, self.out],
+            Axis::Z => [self.out, 0.0],
+        }
+    }
+
+    /// The point `along` this edge, on the outline itself.
+    pub fn point(&self, along: f64) -> [f64; 2] {
+        match self.seg.axis {
+            Axis::X => [along, self.seg.coord],
+            Axis::Z => [self.seg.coord, along],
+        }
+    }
+
+    /// Facing the street (south).
+    pub fn is_street(&self) -> bool {
+        self.seg.axis == Axis::X && self.out < 0.0
+    }
+
+    /// Where `rect` runs along this edge, if its face lies on it.
+    pub fn span(&self, rect: &Rect) -> Option<(f64, f64)> {
+        let (face, lo, hi) = match (self.seg.axis, self.out > 0.0) {
+            (Axis::X, false) => (rect.z, rect.x, rect.x1()),
+            (Axis::X, true) => (rect.z1(), rect.x, rect.x1()),
+            (Axis::Z, false) => (rect.x, rect.z, rect.z1()),
+            (Axis::Z, true) => (rect.x1(), rect.z, rect.z1()),
+        };
+        if (face - self.seg.coord).abs() > EPS {
+            return None;
+        }
+        let (a, b) = (lo.max(self.seg.start), hi.min(self.seg.end));
+        (b - a > EPS).then_some((a, b))
+    }
+}
+
+/// The outline of the union of `rects`: straight edges with their outsides, including
+/// the inner ring of a courtyard. Collinear touching pieces are merged.
+pub fn outline(rects: &[Rect]) -> Vec<Edge> {
+    let coords = |f: &dyn Fn(&Rect) -> [f64; 2]| {
+        let mut v: Vec<f64> = rects.iter().flat_map(f).collect();
+        v.sort_by(f64::total_cmp);
+        v.dedup_by(|a, b| (*a - *b).abs() < EPS);
+        v
+    };
+    let xs = coords(&|r| [r.x, r.x1()]);
+    let zs = coords(&|r| [r.z, r.z1()]);
+    if xs.len() < 2 || zs.len() < 2 {
+        return Vec::new();
+    }
+    let (nx, nz) = (xs.len() - 1, zs.len() - 1);
+    let filled = |i: isize, j: isize| {
+        if i < 0 || j < 0 || i as usize >= nx || j as usize >= nz {
+            return false;
+        }
+        let (cx, cz) = (
+            (xs[i as usize] + xs[i as usize + 1]) / 2.0,
+            (zs[j as usize] + zs[j as usize + 1]) / 2.0,
+        );
+        rects
+            .iter()
+            .any(|r| cx > r.x && cx < r.x1() && cz > r.z && cz < r.z1())
+    };
+    let mut pieces: Vec<Edge> = Vec::new();
+    for i in 0..nx as isize {
+        for j in 0..nz as isize {
+            if !filled(i, j) {
+                continue;
+            }
+            let (x0, x1, z0, z1) = (
+                xs[i as usize],
+                xs[i as usize + 1],
+                zs[j as usize],
+                zs[j as usize + 1],
+            );
+            let mut push = |axis, coord, start, end, out| {
+                pieces.push(Edge {
+                    seg: Segment {
+                        axis,
+                        coord,
+                        start,
+                        end,
+                    },
+                    out,
+                })
+            };
+            if !filled(i, j - 1) {
+                push(Axis::X, z0, x0, x1, -1.0);
+            }
+            if !filled(i, j + 1) {
+                push(Axis::X, z1, x0, x1, 1.0);
+            }
+            if !filled(i - 1, j) {
+                push(Axis::Z, x0, z0, z1, -1.0);
+            }
+            if !filled(i + 1, j) {
+                push(Axis::Z, x1, z0, z1, 1.0);
+            }
+        }
+    }
+    pieces.sort_by(|a, b| {
+        (a.seg.axis as u8, a.out > 0.0)
+            .cmp(&(b.seg.axis as u8, b.out > 0.0))
+            .then(a.seg.coord.total_cmp(&b.seg.coord))
+            .then(a.seg.start.total_cmp(&b.seg.start))
+    });
+    let mut merged: Vec<Edge> = Vec::new();
+    for piece in pieces {
+        if let Some(last) = merged.last_mut() {
+            if last.seg.axis == piece.seg.axis
+                && last.out == piece.out
+                && (last.seg.coord - piece.seg.coord).abs() < EPS
+                && (last.seg.end - piece.seg.start).abs() < EPS
+            {
+                last.seg.end = piece.seg.end;
+                continue;
+            }
+        }
+        merged.push(piece);
+    }
+    merged
+}
+
+/// The edge of `outline` perpendicular to `edge` that meets it at `along`, if any.
+pub fn corner_neighbour(outline: &[Edge], edge: &Edge, along: f64) -> Option<Edge> {
+    outline.iter().copied().find(|e| {
+        e.seg.axis != edge.seg.axis
+            && (e.seg.coord - along).abs() < EPS
+            && ((e.seg.start - edge.seg.coord).abs() < EPS
+                || (e.seg.end - edge.seg.coord).abs() < EPS)
+    })
+}
+
+/// A partition shortened so it stops at the inner face of the facade walls it runs into.
+pub fn clip_to_outline(seg: &Segment, outline: &[Edge], thickness: f64) -> Segment {
+    let meets = |at: f64, out: f64| {
+        outline.iter().any(|e| {
+            e.seg.axis != seg.axis
+                && e.out == out
+                && (e.seg.coord - at).abs() < EPS
+                && seg.coord > e.seg.start - EPS
+                && seg.coord < e.seg.end + EPS
+        })
+    };
+    let mut clipped = *seg;
+    if meets(seg.start, -1.0) {
+        clipped.start += thickness;
+    }
+    if meets(seg.end, 1.0) {
+        clipped.end -= thickness;
+    }
+    clipped
+}
+
 /// A side of the building footprint. South is the street front.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -233,6 +397,48 @@ mod tests {
         assert!((seg.coord - 4.0).abs() < EPS);
         assert!((seg.start - 1.0).abs() < EPS && (seg.end - 3.0).abs() < EPS);
         assert!(a.shared_wall(&Rect::new(5.0, 0.0, 1.0, 1.0)).is_none());
+    }
+
+    #[test]
+    fn outline_of_an_l_and_a_courtyard() {
+        let l = [
+            Rect::new(0.0, 0.0, 10.0, 5.0),
+            Rect::new(0.0, 5.0, 4.0, 5.0),
+        ];
+        let edges = outline(&l);
+        assert_eq!(edges.len(), 6, "an L has six sides: {edges:?}");
+        let perimeter: f64 = edges.iter().map(|e| e.seg.len()).sum();
+        assert!((perimeter - 40.0).abs() < 1e-9);
+
+        let ring = [
+            Rect::new(0.0, 0.0, 12.0, 4.0),
+            Rect::new(0.0, 8.0, 12.0, 4.0),
+            Rect::new(0.0, 4.0, 4.0, 4.0),
+            Rect::new(8.0, 4.0, 4.0, 4.0),
+        ];
+        let edges = outline(&ring);
+        assert_eq!(edges.len(), 8, "outer square and inner courtyard");
+        let inner: Vec<&Edge> = edges.iter().filter(|e| e.seg.len() < 5.0).collect();
+        assert_eq!(inner.len(), 4);
+        // The courtyard's south side faces into the courtyard (north, +z).
+        assert!(
+            inner
+                .iter()
+                .any(|e| e.seg.axis == Axis::X && (e.seg.coord - 4.0).abs() < EPS && e.out > 0.0)
+        );
+    }
+
+    #[test]
+    fn partitions_stop_at_the_facade() {
+        let edges = outline(&[Rect::new(0.0, 0.0, 10.0, 8.0)]);
+        let seg = Segment {
+            axis: Axis::Z,
+            coord: 4.0,
+            start: 0.0,
+            end: 8.0,
+        };
+        let clipped = clip_to_outline(&seg, &edges, 0.4);
+        assert!((clipped.start - 0.4).abs() < EPS && (clipped.end - 7.6).abs() < EPS);
     }
 
     #[test]

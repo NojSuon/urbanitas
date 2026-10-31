@@ -5,8 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::geometry::{Rect, Segment, Side};
-use crate::params::{BuildingParams, Garden};
+use crate::geometry::{Edge, Rect, Segment};
+use crate::params::{BuildingParams, Garden, Shape};
 use crate::style::{Palette, StyleProfile};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -143,6 +143,8 @@ pub enum OpeningKind {
     Storefront,
     /// An open, doorless passage between rooms.
     Archway,
+    /// A garden gate between stone piers, in a garden wall or fence.
+    Gate,
 }
 
 impl OpeningKind {
@@ -153,15 +155,17 @@ impl OpeningKind {
             OpeningKind::BalconyDoor => "Balcony door",
             OpeningKind::Storefront => "Storefront",
             OpeningKind::Archway => "Archway",
+            OpeningKind::Gate => "Gate",
         }
     }
 }
 
-/// An opening in an exterior wall. `center` is measured along the side's axis.
+/// An opening in an exterior wall. `center` is measured along its edge.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Opening {
     pub kind: OpeningKind,
-    pub side: Side,
+    /// The piece of the outline the opening is in.
+    pub edge: Edge,
     pub center: f64,
     pub width: f64,
     pub height: f64,
@@ -180,13 +184,13 @@ impl Opening {
     }
 
     pub fn is_glazed(&self) -> bool {
-        !matches!(self.kind, OpeningKind::Door)
+        !matches!(self.kind, OpeningKind::Door | OpeningKind::Archway)
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Balcony {
-    pub side: Side,
+    pub edge: Edge,
     pub center: f64,
     pub width: f64,
     pub depth: f64,
@@ -199,6 +203,10 @@ pub struct Floor {
     /// Height of the floor surface's underside above the ground.
     pub elevation: f64,
     pub height: f64,
+    /// The wings this floor covers (upper floors may drop some, leaving terraces).
+    pub wings: Vec<Rect>,
+    /// The outline of those wings.
+    pub outline: Vec<Edge>,
     pub rooms: Vec<Room>,
     pub walls: Vec<InteriorWall>,
     pub openings: Vec<Opening>,
@@ -222,8 +230,12 @@ impl Floor {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Roof {
-    /// A walkable terrace behind a low parapet wall.
-    Flat { parapet_height: f64 },
+    /// A walkable terrace behind a low parapet wall or a balustrade.
+    Flat {
+        parapet_height: f64,
+        #[serde(default)]
+        balustrade: bool,
+    },
     /// Four tiled slopes meeting at a ridge.
     Hip {
         pitch_deg: f64,
@@ -235,6 +247,9 @@ pub enum Roof {
 impl Roof {
     pub fn label(&self) -> &'static str {
         match self {
+            Roof::Flat {
+                balustrade: true, ..
+            } => "roof terrace",
             Roof::Flat { .. } => "flat terrace",
             Roof::Hip { .. } => "hipped terracotta",
         }
@@ -243,10 +258,29 @@ impl Roof {
     /// How far the roof rises above the top floor's ceiling slab.
     pub fn rise(&self) -> f64 {
         match *self {
-            Roof::Flat { parapet_height } => parapet_height,
+            Roof::Flat { parapet_height, .. } => parapet_height,
             Roof::Hip { ridge_height, .. } => ridge_height,
         }
     }
+
+    pub fn hip(rect: &Rect, pitch_deg: f64, overhang: f64) -> Roof {
+        let short = rect.w.min(rect.d) + 2.0 * overhang;
+        Roof::Hip {
+            pitch_deg,
+            overhang,
+            ridge_height: short / 2.0 * pitch_deg.to_radians().tan(),
+        }
+    }
+}
+
+/// A roof over one wing, sitting on top of `level - 1`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct RoofSpec {
+    pub rect: Rect,
+    pub level: u32,
+    pub roof: Roof,
+    /// Sides (south, north, west, east) that meet another roof or a taller wall, and so get no parapet.
+    pub open: [bool; 4],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -263,6 +297,13 @@ pub enum FeatureKind {
     /// A columned, arcaded porch.
     Loggia,
     Fountain,
+    /// A paved internal courtyard ringed by a portico.
+    Courtyard,
+    Well,
+    /// Low clipped hedges in a geometric pattern.
+    Parterre,
+    /// A small rooftop loggia (altana).
+    Altana,
 }
 
 impl FeatureKind {
@@ -278,6 +319,10 @@ impl FeatureKind {
             FeatureKind::CypressTree => "cypress",
             FeatureKind::LemonTree => "lemon",
             FeatureKind::Pot => "pot",
+            FeatureKind::Courtyard => "courtyard",
+            FeatureKind::Well => "well",
+            FeatureKind::Parterre => "parterre",
+            FeatureKind::Altana => "altana",
         }
     }
 
@@ -295,6 +340,9 @@ pub struct GardenFeature {
     /// Ground footprint; for trees, the canopy.
     pub rect: Rect,
     pub height: f64,
+    /// The level the feature stands on (0 for the garden; the roof for an altana).
+    #[serde(default)]
+    pub level: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -311,18 +359,27 @@ pub struct Building {
     pub params: BuildingParams,
     pub style: StyleProfile,
     pub palette: Palette,
+    pub shape: Shape,
+    /// The bounding box of the footprint.
     pub footprint: Rect,
+    /// The rectangles the footprint is made of.
+    pub wings: Vec<Rect>,
+    /// The open internal courtyard, for courtyard palazzi.
+    pub courtyard: Option<Rect>,
     pub floors: Vec<Floor>,
-    pub roof: Roof,
+    pub roofs: Vec<RoofSpec>,
     pub garden: Option<GardenPlan>,
 }
 
 impl Building {
-    /// Ground to the top of the roof.
+    /// Ground to the top of the highest roof.
     pub fn height(&self) -> f64 {
-        self.floors.len() as f64 * self.style.floor_height
-            + self.style.slab_thickness
-            + self.roof.rise()
+        self.roofs
+            .iter()
+            .map(|r| {
+                r.level as f64 * self.style.floor_height + self.style.slab_thickness + r.roof.rise()
+            })
+            .fold(0.0, f64::max)
     }
 
     pub fn room_count(&self) -> usize {
@@ -332,5 +389,13 @@ impl Building {
     /// The stair well, shared by every floor of a multi-storey building.
     pub fn stairs(&self) -> Option<Rect> {
         self.floors.first()?.find(RoomKind::Stairs).map(|r| r.rect)
+    }
+
+    /// The main roof's style, for summaries.
+    pub fn roof_label(&self) -> &'static str {
+        self.roofs
+            .iter()
+            .max_by_key(|r| r.level)
+            .map_or("no", |r| r.roof.label())
     }
 }

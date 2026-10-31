@@ -26,10 +26,15 @@ pub mod model;
 pub mod params;
 pub mod parts;
 pub mod rng;
+pub mod site;
 pub mod style;
+pub mod terrain;
 pub mod texture;
 
 pub use generate::generate;
 pub use model::Building;
-pub use params::{ArchitectureStyle, BuildingParams, BuildingType, Garden, ParamError, Size};
+pub use params::{
+    ArchitectureStyle, BuildingParams, BuildingType, Garden, ParamError, Shape, Size,
+};
 pub use parts::{Layout, Part, PartKind};
+pub use site::{Context, SiteParams, generate_site};

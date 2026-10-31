@@ -1,10 +1,11 @@
 use std::collections::{HashSet, VecDeque};
 
 use urbanitas::export::json;
-use urbanitas::geometry::{EPS, Side};
+use urbanitas::geometry::{EPS, Rect, clip_to_outline};
 use urbanitas::model::{Floor, OpeningKind, RoomKind};
 use urbanitas::{
-    ArchitectureStyle, Building, BuildingParams, BuildingType, Garden, ParamError, Size, generate,
+    ArchitectureStyle, Building, BuildingParams, BuildingType, Garden, ParamError, Shape, Size,
+    generate,
 };
 
 const TYPES: [BuildingType; 4] = [
@@ -45,6 +46,7 @@ fn sweep() -> impl Iterator<Item = BuildingParams> {
                             rooms,
                             garden,
                             style,
+                            shape: Shape::Auto,
                         })
                     })
                 })
@@ -53,16 +55,19 @@ fn sweep() -> impl Iterator<Item = BuildingParams> {
     })
 }
 
-fn assert_rooms_tile_footprint(b: &Building, floor: &Floor) {
-    let fp = b.footprint;
+fn assert_rooms_tile_floor(floor: &Floor) {
+    let wings: f64 = floor.wings.iter().map(Rect::area).sum();
     let area: f64 = floor.rooms.iter().map(|r| r.rect.area()).sum();
     assert!(
-        (area - fp.area()).abs() < 1e-6,
-        "rooms cover {area} of {} m²",
-        fp.area()
+        (area - wings).abs() < 1e-6,
+        "rooms cover {area} of {wings} m²"
     );
     for (i, a) in floor.rooms.iter().enumerate() {
-        assert!(fp.contains(&a.rect), "room {i} leaves the footprint");
+        assert!(
+            floor.wings.iter().any(|w| w.contains(&a.rect)),
+            "room {i} leaves its wing: {:?}",
+            a.rect
+        );
         assert!(
             a.rect.min_side() > 1.2,
             "room {i} is a sliver: {:?}",
@@ -75,6 +80,11 @@ fn assert_rooms_tile_footprint(b: &Building, floor: &Floor) {
                 a.rect,
                 other.rect
             );
+        }
+    }
+    for (i, a) in floor.wings.iter().enumerate() {
+        for b in &floor.wings[i + 1..] {
+            assert!(!a.intersects(b), "wings overlap");
         }
     }
 }
@@ -109,9 +119,7 @@ fn assert_all_rooms_reachable(floor: &Floor) {
 fn assert_doors_clear_of_outer_walls(b: &Building, floor: &Floor) {
     for wall in &floor.walls {
         let Some(door) = wall.door else { continue };
-        let clear = wall
-            .segment
-            .inside_walls(&b.footprint, b.style.wall_thickness);
+        let clear = clip_to_outline(&wall.segment, &floor.outline, b.style.wall_thickness);
         assert!(
             door.center - door.width / 2.0 >= clear.start - EPS
                 && door.center + door.width / 2.0 <= clear.end + EPS,
@@ -120,28 +128,48 @@ fn assert_doors_clear_of_outer_walls(b: &Building, floor: &Floor) {
     }
 }
 
-fn assert_openings_fit(b: &Building, floor: &Floor) {
-    for side in Side::ALL {
-        let mut spans: Vec<(f64, f64)> = floor
-            .openings
-            .iter()
-            .filter(|o| o.side == side)
-            .map(|o| (o.start(), o.end()))
-            .collect();
-        spans.sort_by(|a, b| a.0.total_cmp(&b.0));
-        for pair in spans.windows(2) {
-            assert!(
-                pair[0].1 <= pair[1].0 + EPS,
-                "openings overlap on {side:?}: {pair:?}"
-            );
+fn assert_outline_closed(floor: &Floor) {
+    // Every corner of the outline is shared by exactly two edges.
+    let mut corners: Vec<(i64, i64)> = Vec::new();
+    for e in &floor.outline {
+        for along in [e.seg.start, e.seg.end] {
+            let p = e.point(along);
+            corners.push((
+                (p[0] * 1000.0).round() as i64,
+                (p[1] * 1000.0).round() as i64,
+            ));
+        }
+    }
+    corners.sort();
+    for chunk in corners.chunk_by(|a, b| a == b) {
+        assert_eq!(
+            chunk.len() % 2,
+            0,
+            "{} outline is open at {:?}",
+            floor.name(),
+            chunk[0]
+        );
+    }
+}
+
+fn assert_openings_fit(floor: &Floor) {
+    for (i, a) in floor.openings.iter().enumerate() {
+        for b in &floor.openings[i + 1..] {
+            if a.edge == b.edge {
+                assert!(
+                    a.end() <= b.start() + EPS || b.end() <= a.start() + EPS,
+                    "openings overlap: {a:?} {b:?}"
+                );
+            }
         }
     }
     for o in &floor.openings {
+        assert!(floor.outline.contains(&o.edge), "opening off the outline");
         let room = &floor.rooms[o.room];
-        let (a, b_) = room
-            .rect
-            .span_on_side(o.side, &b.footprint)
-            .expect("opening on an outside wall");
+        let (a, b_) = o
+            .edge
+            .span(&room.rect)
+            .expect("opening on its room's outside wall");
         assert!(
             o.start() >= a - EPS && o.end() <= b_ + EPS,
             "opening leaves its room"
@@ -153,12 +181,73 @@ fn assert_openings_fit(b: &Building, floor: &Floor) {
     }
 }
 
+fn check(b: &Building, p: &BuildingParams) {
+    assert_eq!(b.floors.len(), p.floors as usize);
+    for floor in &b.floors {
+        let living = floor
+            .rooms
+            .iter()
+            .filter(|r| !r.kind.is_circulation())
+            .count();
+        assert!(
+            living >= 1 && living <= p.rooms as usize + floor.wings.len() + 1,
+            "{p:?}: {living} rooms"
+        );
+        assert_rooms_tile_floor(floor);
+        assert_outline_closed(floor);
+        assert_all_rooms_reachable(floor);
+        assert_doors_clear_of_outer_walls(b, floor);
+        assert_openings_fit(floor);
+    }
+    let ground = &b.floors[0];
+    assert!(
+        ground
+            .openings
+            .iter()
+            .any(|o| o.kind == OpeningKind::Door && o.edge.is_street()),
+        "{p:?} has no front door"
+    );
+    if let Some(court) = b.courtyard {
+        // A way into the courtyard from the androne.
+        assert!(
+            ground
+                .openings
+                .iter()
+                .any(|o| o.kind == OpeningKind::Archway
+                    && o.edge.out > 0.0
+                    && (o.edge.seg.coord - court.z).abs() < EPS),
+            "{p:?}: courtyard has no way in"
+        );
+    }
+    if p.floors > 1 {
+        let stairs = b.stairs().expect("stairs");
+        for floor in &b.floors {
+            assert_eq!(floor.find(RoomKind::Stairs).map(|r| r.rect), Some(stairs));
+        }
+    } else {
+        assert!(b.stairs().is_none());
+    }
+    if p.garden != Garden::None {
+        let garden = b.garden.as_ref().expect("a garden");
+        assert!(garden.lot.contains(&b.footprint));
+        for f in garden.features.iter().filter(|f| f.level == 0) {
+            assert!(garden.lot.contains(&f.rect), "{:?} outside the lot", f.kind);
+            if f.kind.is_tree() && b.courtyard.is_none_or(|c| !c.contains(&f.rect)) {
+                assert!(
+                    b.wings.iter().all(|w| !f.rect.intersects(w)),
+                    "tree inside the house"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn default_building_generates() {
     let b = generate(&BuildingParams::default()).unwrap();
     assert_eq!(b.floors.len(), 2);
-    // 4 rooms per floor plus the hall and stairs.
-    assert!(b.floors.iter().all(|f| f.rooms.len() == 6));
+    // Rooms on every floor plus the hall and stairs.
+    assert!(b.floors.iter().all(|f| f.rooms.len() >= 3));
     assert!(b.garden.is_some());
     assert!(b.height() > 2.0 * b.style.floor_height);
 }
@@ -177,44 +266,72 @@ fn sweep_holds_invariants() {
     let mut checked = 0;
     for p in sweep() {
         let b = generate(&p).unwrap_or_else(|e| panic!("{p:?} failed: {e}"));
-        assert_eq!(b.floors.len(), p.floors as usize);
-        let circulation = if p.floors > 1 { 2 } else { 0 };
-        for floor in &b.floors {
-            assert_eq!(floor.rooms.len(), p.rooms as usize + circulation, "{p:?}");
-            assert_rooms_tile_footprint(&b, floor);
-            assert_all_rooms_reachable(floor);
-            assert_doors_clear_of_outer_walls(&b, floor);
-            assert_openings_fit(&b, floor);
-        }
-        let ground = &b.floors[0];
-        assert!(
-            ground
-                .openings
-                .iter()
-                .any(|o| o.kind == OpeningKind::Door && o.side == Side::South),
-            "{p:?} has no front door"
-        );
-        if p.floors > 1 {
-            let stairs = b.stairs().expect("stairs");
-            for floor in &b.floors {
-                assert_eq!(floor.find(RoomKind::Stairs).map(|r| r.rect), Some(stairs));
-            }
-        } else {
-            assert!(b.stairs().is_none());
-        }
-        assert_eq!(b.garden.is_some(), p.garden != Garden::None);
-        if let Some(garden) = &b.garden {
-            assert!(garden.lot.contains(&b.footprint));
-            for f in &garden.features {
-                assert!(garden.lot.contains(&f.rect), "{:?} outside the lot", f.kind);
-                if f.kind.is_tree() {
-                    assert!(!f.rect.intersects(&b.footprint), "tree inside the house");
+        check(&b, &p);
+        checked += 1;
+    }
+    assert_eq!(checked, 3 * 4 * 4 * 4 * 7 * 6);
+}
+
+#[test]
+fn every_shape_holds_invariants() {
+    let mut shapes_seen = HashSet::new();
+    for style in ArchitectureStyle::ALL {
+        for shape in Shape::ALL {
+            for building_type in TYPES {
+                for floors in 1..=4 {
+                    for seed in 0..4 {
+                        let p = BuildingParams {
+                            seed,
+                            floors,
+                            size: Size {
+                                width: 22.0,
+                                depth: 20.0,
+                            },
+                            building_type,
+                            rooms: 6,
+                            garden: Garden::Surrounding,
+                            style,
+                            shape,
+                        };
+                        let b = generate(&p).unwrap_or_else(|e| panic!("{p:?} failed: {e}"));
+                        check(&b, &p);
+                        shapes_seen.insert(b.shape);
+                    }
                 }
             }
         }
-        checked += 1;
     }
-    assert_eq!(checked, 2 * 4 * 4 * 4 * 7 * 6);
+    for shape in [
+        Shape::Block,
+        Shape::L,
+        Shape::T,
+        Shape::U,
+        Shape::Courtyard,
+        Shape::Stepped,
+    ] {
+        assert!(shapes_seen.contains(&shape), "{shape:?} never built");
+    }
+}
+
+#[test]
+fn plans_vary() {
+    // Auto shapes give different footprints across seeds.
+    let mut outlines = HashSet::new();
+    for seed in 0..20 {
+        let p = BuildingParams {
+            seed,
+            size: Size {
+                width: 18.0,
+                depth: 16.0,
+            },
+            building_type: BuildingType::Villa,
+            rooms: 5,
+            ..BuildingParams::default()
+        };
+        let b = generate(&p).unwrap();
+        outlines.insert(b.floors[0].outline.len());
+    }
+    assert!(outlines.len() >= 2, "every villa had the same outline");
 }
 
 #[test]

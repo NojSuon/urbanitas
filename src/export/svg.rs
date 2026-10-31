@@ -325,10 +325,31 @@ fn area(s: &mut String, view: &View, a: &AreaPart) {
             s,
             r##"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" fill="#EBD9C4" stroke="#9A9C96" stroke-width="4"/>"##
         ),
-        AreaKind::Hedge => writeln!(
+        AreaKind::Hedge | AreaKind::Parterre => writeln!(
             s,
             r##"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" fill="#4F7A35"/>"##
         ),
+        AreaKind::Courtyard | AreaKind::Piazza => writeln!(
+            s,
+            r##"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" fill="#E6DCC8" stroke="#9A9C96" stroke-width="2"/>"##
+        ),
+        AreaKind::Street => writeln!(
+            s,
+            r##"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" fill="#8E8B86"/>"##
+        ),
+        AreaKind::Road => writeln!(
+            s,
+            r##"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" fill="#E8DFCB"/>"##
+        ),
+        AreaKind::Vineyard => writeln!(
+            s,
+            r##"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" fill="#B9C78A" stroke="#6E7F3E" stroke-dasharray="2 6"/>"##
+        ),
+        AreaKind::Tower => writeln!(
+            s,
+            r##"<rect x="{x:.1}" y="{y:.1}" width="{w:.1}" height="{h:.1}" fill="#3B342C"/>"##
+        ),
+        AreaKind::Platform => Ok(()),
     };
 }
 
@@ -363,7 +384,11 @@ fn prop(s: &mut String, view: &View, p: &PropPart) {
             r##"<circle cx="{x:.1}" cy="{y:.1}" r="{:.1}" fill="#C9B48F"/>"##,
             r * 0.5
         ),
-        PropKind::Column | PropKind::Lamp => writeln!(
+        PropKind::StonePine | PropKind::Palm => writeln!(
+            s,
+            r##"<circle cx="{x:.1}" cy="{y:.1}" r="{r:.1}" fill="#5E7A45" fill-opacity="0.8" stroke="#3E5A30"/>"##
+        ),
+        PropKind::Column | PropKind::Lamp | PropKind::Well | PropKind::Urn => writeln!(
             s,
             r##"<circle cx="{x:.1}" cy="{y:.1}" r="{r:.1}" fill="#9A9C96"/>"##
         ),

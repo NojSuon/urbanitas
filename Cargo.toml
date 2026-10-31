@@ -2,7 +2,7 @@
 name = "urbanitas"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 authors = ["Noj Suon"]
 description = "Procedural building generator: floors, rooms, gardens and architectural styles, exported as OBJ meshes, SVG floor plans and JSON."
 license = "MIT"

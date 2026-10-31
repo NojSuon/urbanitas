@@ -2,7 +2,7 @@
 name = "urbanitas-app"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 authors = ["Noj Suon"]
 description = "Interactive Urbanitas building app: generate buildings live and edit them part by part."
 license = "MIT"
