@@ -270,21 +270,10 @@ impl<'a> Town<'a> {
 
     /// Levels the piazza and furnishes it. Returns its rectangle.
     fn piazza(&mut self) -> Result<Rect, TownError> {
-        let side = (20.0 + self.params.houses as f64 * 0.3).clamp(22.0, 34.0);
-        let r = Rect::new(
-            self.plaza[0] - side / 2.0,
-            self.plaza[1] - side / 2.0,
-            side,
-            side,
-        );
-        if !self.terrain().rect.grow(-8.0).contains(&r) {
-            return Err(TownError::OffMap);
-        }
+        let r = piazza_check(self.layout, self.plaza, self.params.houses)?;
+        let side = r.w;
         let water = self.layout.water.as_ref();
         let t = self.layout.terrain.as_ref().unwrap();
-        if !dry_square(water, t, &r) {
-            return Err(TownError::InWater);
-        }
         let level = t.height_at(self.plaza).max(water.map_or(f64::MIN, |w| {
             w.surface_near(self.plaza, 50.0).unwrap_or(f64::MIN) + 1.0
         }));
@@ -706,6 +695,16 @@ impl<'a> Town<'a> {
         let level = (low + high) / 2.0;
         let goal = target.center();
         let group = design.place(self.layout, [goal.0, goal.1], quarters as u8, level, link);
+        if !link {
+            let kind_name = match kind {
+                HouseKind::Palazzo => "Palazzo",
+                HouseKind::House => "Casa",
+                HouseKind::Villa => "Villa",
+                HouseKind::Beach => "Casa al mare",
+                HouseKind::Cliff => "Villa sulla scogliera",
+            };
+            self.layout.module_mut(group).name = format!("{kind_name} {}", group + 1);
+        }
         // A stone plinth under the whole lot, just below its garden: where the ground
         // falls away it shows as a terrace wall.
         self.layout.add_in(
@@ -830,6 +829,27 @@ pub fn level_pads(t: &mut Terrain, pads: &[(Rect, f64)], falloff: f64) {
             t.set(i, j, h + (level - h) * k);
         }
     }
+}
+
+/// The piazza a town of `houses` houses gets, centred on `plaza`.
+pub fn piazza_rect(plaza: P2, houses: u32) -> Rect {
+    let side = (20.0 + houses as f64 * 0.3).clamp(22.0, 34.0);
+    Rect::new(plaza[0] - side / 2.0, plaza[1] - side / 2.0, side, side)
+}
+
+/// Whether a piazza fits at `plaza`: on the map and out of the water. Returns its rectangle.
+pub fn piazza_check(layout: &Layout, plaza: P2, houses: u32) -> Result<Rect, TownError> {
+    let r = piazza_rect(plaza, houses);
+    let Some(t) = layout.terrain.as_ref() else {
+        return Ok(r);
+    };
+    if !t.rect.grow(-8.0).contains(&r) {
+        return Err(TownError::OffMap);
+    }
+    if !dry_square(layout.water.as_ref(), t, &r) {
+        return Err(TownError::InWater);
+    }
+    Ok(r)
 }
 
 /// A good spot for a piazza: the gentlest dry ground near the middle of the map.

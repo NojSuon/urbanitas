@@ -1,6 +1,7 @@
 //! Build mode: the parts catalogue, Sims-style placement with grid snapping (or free
-//! placement while Alt is held), whole-building selection, terrain sculpting, moving,
-//! rotating, deleting and the ghost preview.
+//! placement while Alt is held), whole-house selection, streets that fill with houses,
+//! design copies, terrain sculpting, moving, turning, deleting and the ghost preview.
+//! In Generate mode, a click places the town's piazza.
 
 use std::f64::consts::{FRAC_PI_2, PI};
 
@@ -13,7 +14,7 @@ use urbanitas::model::{OpeningKind, Roof};
 use urbanitas::parts::*;
 use urbanitas::style::OpeningSpec;
 use urbanitas::terrain::{Brush, Terrain};
-use urbanitas::{BuildingParams, generate};
+use urbanitas::{BuildingParams, fill_street, generate, piazza_check};
 
 use crate::project::{Mode, Project};
 use crate::scene::{MainCamera, bevy_mesh, merged};
@@ -53,12 +54,11 @@ pub enum Category {
     Roofs,
     Garden,
     Streets,
-    Terrain,
     Buildings,
 }
 
 impl Category {
-    pub const ALL: [Category; 8] = [
+    pub const ALL: [Category; 7] = [
         Category::Buildings,
         Category::Walls,
         Category::Openings,
@@ -66,7 +66,6 @@ impl Category {
         Category::Roofs,
         Category::Garden,
         Category::Streets,
-        Category::Terrain,
     ];
 
     pub fn label(self) -> &'static str {
@@ -77,7 +76,6 @@ impl Category {
             Category::Roofs => "Roofs",
             Category::Garden => "Garden",
             Category::Streets => "Streets",
-            Category::Terrain => "Terrain",
             Category::Buildings => "Buildings",
         }
     }
@@ -89,6 +87,18 @@ pub enum Sculpt {
     Lower,
     Flatten,
     Smooth,
+    /// Paints beach sand.
+    Sand,
+}
+
+impl Sculpt {
+    pub const ALL: [Sculpt; 5] = [
+        Sculpt::Raise,
+        Sculpt::Lower,
+        Sculpt::Flatten,
+        Sculpt::Smooth,
+        Sculpt::Sand,
+    ];
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -112,6 +122,10 @@ pub enum Item {
     Terrain(Sculpt),
     /// A whole generated building, from the current parameters.
     Building,
+    /// A street that fills with houses on both sides.
+    Street,
+    /// A copy of saved design number `n`.
+    Design(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,6 +193,7 @@ impl Item {
                 Item::Prop(P::Pot),
             ],
             Category::Streets => vec![
+                Item::Street,
                 Item::Area(A::Street),
                 Item::Area(A::Piazza),
                 Item::Area(A::Road),
@@ -187,12 +202,6 @@ impl Item {
                 Item::Prop(P::Urn),
                 Item::Prop(P::Bench),
                 Item::Prop(P::Lamp),
-            ],
-            Category::Terrain => vec![
-                Item::Terrain(Sculpt::Raise),
-                Item::Terrain(Sculpt::Lower),
-                Item::Terrain(Sculpt::Flatten),
-                Item::Terrain(Sculpt::Smooth),
             ],
         }
     }
@@ -228,13 +237,16 @@ impl Item {
             Item::Terrain(Sculpt::Lower) => "Lower",
             Item::Terrain(Sculpt::Flatten) => "Flatten",
             Item::Terrain(Sculpt::Smooth) => "Smooth",
+            Item::Terrain(Sculpt::Sand) => "Sand",
             Item::Building => "New building",
+            Item::Street => "Street with houses",
+            Item::Design(_) => "Design copy",
         }
     }
 
     pub fn placement(self) -> Placement {
         match self {
-            Item::Wall(..) => Placement::Line,
+            Item::Wall(..) | Item::Street => Placement::Line,
             Item::Floor | Item::HipRoof | Item::FlatRoof | Item::Area(_) => Placement::Rect,
             Item::ArchedWindow
             | Item::SquareWindow
@@ -245,18 +257,24 @@ impl Item {
             | Item::Archway
             | Item::Gate
             | Item::Balcony => Placement::Mounted,
-            Item::Stairs | Item::Prop(_) | Item::Building => Placement::Point,
+            Item::Stairs | Item::Prop(_) | Item::Building | Item::Design(_) => Placement::Point,
             Item::Terrain(_) => Placement::Brush,
         }
     }
 
     pub fn hint(self) -> &'static str {
         match self.placement() {
+            Placement::Line if self == Item::Street => {
+                "Drag to draw a street: houses fill both sides"
+            }
             Placement::Line => "Drag along the grid to draw a wall",
             Placement::Rect => "Drag from corner to corner",
             Placement::Mounted => "Point at a wall and click",
             Placement::Point if self == Item::Building => {
                 "Click to place a building from the Generate settings"
+            }
+            Placement::Point if matches!(self, Item::Design(_)) => {
+                "Click to place a copy · R to turn it"
             }
             Placement::Point => "Click to place · R to turn",
             Placement::Brush => "Hold the left button and paint the ground",
@@ -279,6 +297,12 @@ pub struct Tool {
     /// The height a flatten stroke levels to.
     flatten_to: Option<f64>,
     stroking: bool,
+    /// Where the last brush dab landed, so fast strokes stay continuous.
+    last_dab: Option<P2>,
+    /// Ground the brush leaves alone during a stroke: house plots and piazzas.
+    protect: Vec<Rect>,
+    /// Frames since the stroke began (Low quality redraws the ground every other frame).
+    stroke_frames: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -300,6 +324,9 @@ impl Default for Tool {
             moving: None,
             flatten_to: None,
             stroking: false,
+            last_dab: None,
+            protect: Vec::new(),
+            stroke_frames: 0,
         }
     }
 }
@@ -310,6 +337,12 @@ impl Tool {
         self.drag_start = None;
         self.moving = None;
         self.stroking = false;
+        self.last_dab = None;
+    }
+
+    /// Quarter turns clockwise the tool's yaw stands for (R turns by one).
+    pub fn turns(&self) -> u8 {
+        ((-self.yaw / FRAC_PI_2).round() as i64).rem_euclid(4) as u8
     }
 }
 
@@ -325,7 +358,7 @@ pub struct Pointer {
     pub whole: bool,
     pub over_ui: bool,
     pub ui_wants_keyboard: bool,
-    /// Pins the pointer to a spot (scripted screenshots).
+    /// Pins the pointer to a spot (scripted screenshots) until the real mouse moves.
     pub forced: Option<P2>,
 }
 
@@ -731,7 +764,7 @@ fn remount(layout: &Layout, part: &mut Part) {
 }
 
 /// The part under the pointer on the active level, preferring small and specific parts.
-pub fn pick(layout: &Layout, level: u32, p: P2) -> Option<PartId> {
+pub fn pick(layout: &Layout, level: u32, p: P2, only: Option<u32>) -> Option<PartId> {
     let rank = |part: &Part| match &part.kind {
         PartKind::Opening(_) => 0,
         PartKind::Balcony(_) => 1,
@@ -745,6 +778,7 @@ pub fn pick(layout: &Layout, level: u32, p: P2) -> Option<PartId> {
     };
     layout
         .on_level(level)
+        .filter(|part| only.is_none_or(|g| part.group == Some(g)))
         .filter(|part| {
             let r = part.footprint().grow(0.1);
             p[0] >= r.x && p[0] <= r.x1() && p[1] >= r.z && p[1] <= r.z1()
@@ -797,19 +831,32 @@ fn track_pointer(
     keys: Res<ButtonInput<KeyCode>>,
     window: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform), With<MainCamera>>,
+    mut pinned_at: Local<Option<Option<Vec2>>>,
 ) {
     pointer.free = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
     pointer.whole = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    let cursor = window.single().ok().and_then(Window::cursor_position);
     if let Some(forced) = pointer.forced {
-        pointer.ground = Some(forced);
-        pointer.height = surface_height(&project, forced);
-        return;
+        // A scripted pin holds only until a person moves the mouse.
+        let first = *pinned_at.get_or_insert(cursor);
+        let moved = match (first, cursor) {
+            (Some(a), Some(b)) => a.distance(b) > 3.0,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if !moved {
+            pointer.ground = Some(forced);
+            pointer.height = surface_height(&project, forced);
+            return;
+        }
+        pointer.forced = None;
     }
+    *pinned_at = None;
     pointer.ground = None;
-    let (Ok(window), Ok((camera, transform))) = (window.single(), camera.single()) else {
+    let Ok((camera, transform)) = camera.single() else {
         return;
     };
-    let Some(cursor) = window.cursor_position() else {
+    let Some(cursor) = cursor else {
         return;
     };
     let Ok(ray) = camera.viewport_to_world(transform, cursor) else {
@@ -864,6 +911,11 @@ fn keyboard(
         project.redo();
         return;
     }
+    if keys.just_pressed(KeyCode::Escape) && project.placing_piazza {
+        project.placing_piazza = false;
+        project.status = "Piazza placing cancelled".into();
+        return;
+    }
     if project.mode != Mode::Build {
         return;
     }
@@ -873,8 +925,9 @@ fn keyboard(
         FRAC_PI_2
     };
     if keys.just_pressed(KeyCode::KeyR) {
-        match (tool.item, project.selected) {
-            (None, Some(id)) => rotate_selected(&mut project, id),
+        match (tool.item, project.selected, project.selected_group) {
+            (None, _, Some(g)) => turn_group(&mut project, g),
+            (None, Some(id), None) => rotate_selected(&mut project, id),
             _ => {
                 tool.yaw -= FRAC_PI_2;
                 tool.heading = tool.heading.turned_right();
@@ -897,9 +950,13 @@ fn keyboard(
         }
     }
     if keys.just_pressed(KeyCode::Escape) {
+        let idle = tool.item.is_none() && project.selected.is_none();
         tool.pick(None);
         project.selected = None;
         project.selected_group = None;
+        if idle && project.open_group.is_some() {
+            close_house(&mut project);
+        }
     }
     if keys.just_pressed(KeyCode::PageUp) {
         let up = (project.level + 1).min(project.top_level() + 1);
@@ -936,13 +993,122 @@ pub fn delete_part(project: &mut Project, id: PartId) {
 }
 
 pub fn delete_group(project: &mut Project, group: u32) {
-    let levels: Vec<u32> = project.layout.group_parts(group).map(|p| p.level).collect();
-    project.edit(&levels, None, |layout| {
-        layout.parts.retain(|p| p.group != Some(group))
-    });
+    let levels = project.group_levels(group);
+    let name = house_name(project, group);
+    project.edit(&levels, None, |layout| layout.remove_group(group));
     project.selected = None;
     project.selected_group = None;
-    project.status = format!("Removed building {}", group + 1);
+    if project.open_group == Some(group) {
+        project.open_group = None;
+        project.mark_all();
+    }
+    project.status = format!("Removed {name}");
+}
+
+/// A house's name, as the module records it.
+pub fn house_name(project: &Project, group: u32) -> String {
+    project
+        .layout
+        .module(group)
+        .map_or_else(|| format!("House {}", group + 1), |m| m.name.clone())
+}
+
+/// Turns a whole house a quarter turn clockwise about the middle of its plot.
+pub fn turn_group(project: &mut Project, group: u32) {
+    let Some(lot) = project
+        .layout
+        .module(group)
+        .and_then(|m| m.lot)
+        .or_else(|| group_bounds(&project.layout, group))
+    else {
+        return;
+    };
+    let (cx, cz) = lot.center();
+    let levels = project.group_levels(group);
+    project.edit(&levels, None, |layout| {
+        for part in layout.parts.iter_mut().filter(|p| p.group == Some(group)) {
+            part.rotate_quarter_about([cx, cz]);
+        }
+        let module = layout.module_mut(group);
+        module.turns = (module.turns + 1) % 4;
+        module.lot = Some(Rect::new(cx - lot.d / 2.0, cz - lot.w / 2.0, lot.d, lot.w));
+    });
+    project.status = format!("Turned {}", house_name(project, group));
+}
+
+/// Opens a house to edit it on its own: the other houses hide until it's closed.
+pub fn open_house(project: &mut Project, group: u32) {
+    project.open_group = Some(group);
+    project.selected_group = None;
+    project.selected = None;
+    project.mode = Mode::Build;
+    project.mark_all();
+    project.status = format!(
+        "Editing {} on its own · Esc or Close house when done",
+        house_name(project, group)
+    );
+}
+
+pub fn close_house(project: &mut Project) {
+    if let Some(g) = project.open_group.take() {
+        project.selected_group = Some(g);
+        project.mark_all();
+        project.status = format!("Closed {}", house_name(project, g));
+    }
+}
+
+/// Places a copy of saved design `index` centred on `at`, turned `turns` quarter turns, on a
+/// levelled pad.
+pub fn place_design(project: &mut Project, index: usize, at: P2, turns: u8) {
+    let Some(design) = project.designs.get(index).cloned() else {
+        return;
+    };
+    let (w, d) = if turns % 2 == 1 {
+        (design.lot.d, design.lot.w)
+    } else {
+        (design.lot.w, design.lot.d)
+    };
+    let lot = Rect::new(at[0] - w / 2.0, at[1] - d / 2.0, w, d);
+    let levels: Vec<u32> = (0..=design.parts.iter().map(|p| p.level).max().unwrap_or(0)).collect();
+    let mut group = 0;
+    project.edit(&levels, None, |layout| {
+        let ground = match layout.terrain.as_mut() {
+            Some(t) => {
+                let (lo, hi) = t.range_in(&lot);
+                let level = (lo + hi) / 2.0;
+                t.flatten_pad(&lot.grow(0.3), level, 4.0);
+                level
+            }
+            None => 0.0,
+        };
+        group = design.place(layout, at, turns, ground, true);
+    });
+    project.mark_terrain();
+    project.selected = None;
+    project.selected_group = Some(group);
+    project.status = format!("Placed a copy of {}", design.name);
+}
+
+/// Draws a street from `a` to `b` and fills both sides with houses.
+fn draw_street(project: &mut Project, a: P2, b: P2) {
+    if ((a[0] - b[0]).abs()).max((a[1] - b[1]).abs()) < 8.0 {
+        project.status = "Drag further: a street needs room for houses".into();
+        return;
+    }
+    let params = urbanitas::TownParams {
+        seed: project.town.seed ^ project.layout.next_id,
+        houses: 40,
+        ..project.town
+    };
+    let designs = project.designs.clone();
+    let mut report = Default::default();
+    let levels: Vec<u32> = (0..=project.top_level() + 6).collect();
+    project.edit(&levels, None, |layout| {
+        report = fill_street(layout, a, b, &params, &designs);
+    });
+    let report: urbanitas::town::TownReport = report;
+    project.mark_all();
+    project.status = format!("New street with {} houses", report.houses);
 }
 
 pub fn rotate_selected(project: &mut Project, id: PartId) {
@@ -1021,17 +1187,41 @@ fn mouse(
     mut tool: ResMut<Tool>,
     pointer: Res<Pointer>,
 ) {
-    if project.mode != Mode::Build {
-        return;
-    }
     let Some(p) = pointer.ground else { return };
     let pressed = buttons.just_pressed(MouseButton::Left) && !pointer.over_ui;
     let released = buttons.just_released(MouseButton::Left);
+    if project.placing_piazza {
+        if pressed {
+            match piazza_check(&project.layout, p, project.town.houses) {
+                Ok(_) => {
+                    project.placing_piazza = false;
+                    project.grow_town_at(p);
+                }
+                Err(err) => project.status = format!("Not there: {err}"),
+            }
+        }
+        return;
+    }
+    if project.mode != Mode::Build {
+        return;
+    }
+
+    if tool.item == Some(Item::Street) {
+        if pressed {
+            tool.drag_start = Some(snap(p, pointer.free));
+        }
+        if released {
+            if let Some(a) = tool.drag_start.take() {
+                draw_street(&mut project, a, street_end(a, snap(p, pointer.free)));
+            }
+        }
+        return;
+    }
 
     let Some(item) = tool.item else {
         if pressed {
             let level = project.level;
-            let hit = pick(&project.layout, level, p);
+            let hit = pick(&project.layout, level, p, project.open_group);
             let group = hit
                 .and_then(|id| project.layout.get(id))
                 .and_then(|part| part.group);
@@ -1040,8 +1230,8 @@ fn mouse(
                 project.selected_group = group;
                 tool.moving = group.map(|g| (Grab::Group(g), p));
                 project.status = format!(
-                    "Building {} · drag to move · Delete to remove",
-                    group.unwrap_or(0) + 1
+                    "{} · drag to move · R to turn · Delete to remove",
+                    house_name(&project, group.unwrap_or(0))
                 );
             } else {
                 project.selected = hit;
@@ -1091,6 +1281,11 @@ fn mouse(
                     place_building(&mut project, &params, snap(p, pointer.free));
                     return;
                 }
+                if let Item::Design(index) = item {
+                    let turns = tool.turns();
+                    place_design(&mut project, index, snap(p, pointer.free), turns);
+                    return;
+                }
                 match candidate(&project, &tool, &pointer) {
                     Some(c) if c.valid => place(&mut project, c, item),
                     Some(_) => project.status = "That does not fit there".into(),
@@ -1115,10 +1310,14 @@ fn move_grab(project: &mut Project, grab: Grab, delta: P2) {
             });
         }
         Grab::Group(g) => {
-            let levels: Vec<u32> = project.layout.group_parts(g).map(|p| p.level).collect();
+            let levels = project.group_levels(g);
             project.edit(&levels, None, |layout| {
                 for part in layout.parts.iter_mut().filter(|p| p.group == Some(g)) {
                     part.translate(delta);
+                }
+                if let Some(lot) = layout.module_mut(g).lot.as_mut() {
+                    lot.x += delta[0];
+                    lot.z += delta[1];
                 }
             });
         }
@@ -1136,7 +1335,58 @@ fn place(project: &mut Project, c: Candidate, item: Item) {
     project.status = format!("Placed {}", item.label());
 }
 
-/// Terrain brushes: paint while the button is held; afterwards loose parts settle onto the new ground.
+/// A street drawn from `a` runs straight along whichever axis is nearer to the pointer.
+fn street_end(a: P2, b: P2) -> P2 {
+    if (b[0] - a[0]).abs() >= (b[1] - a[1]).abs() {
+        [b[0], a[1]]
+    } else {
+        [a[0], b[1]]
+    }
+}
+
+/// Ground the brush must leave alone: every house's plot and every piazza, tower and plinth.
+fn protected_ground(layout: &Layout) -> Vec<Rect> {
+    let mut out: Vec<Rect> = (0..layout.palettes.len() as u32)
+        .filter_map(|g| {
+            layout
+                .module(g)
+                .and_then(|m| m.lot)
+                .or_else(|| group_bounds(layout, g))
+        })
+        .map(|r| r.grow(0.4))
+        .collect();
+    out.extend(layout.on_level(0).filter_map(|p| match &p.kind {
+        PartKind::Area(a)
+            if p.group.is_none()
+                && matches!(
+                    a.kind,
+                    AreaKind::Piazza | AreaKind::Tower | AreaKind::Platform
+                ) =>
+        {
+            Some(a.rect.grow(0.4))
+        }
+        _ => None,
+    }));
+    out
+}
+
+/// How strongly the brush acts at `p`: nothing on protected ground, fading in over 1.5 m.
+fn brush_mask(protect: &[Rect], p: P2) -> f64 {
+    protect
+        .iter()
+        .map(|r| {
+            let dx = (r.x - p[0]).max(p[0] - r.x1()).max(0.0);
+            let dz = (r.z - p[1]).max(p[1] - r.z1()).max(0.0);
+            let d = (dx * dx + dz * dz).sqrt() / 1.5;
+            let t = d.clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        })
+        .fold(1.0, f64::min)
+}
+
+/// Terrain brushes: dabs are stamped along the pointer's path while the button is held (and
+/// keep building up while it rests), sparing house plots; afterwards loose trees and paths
+/// settle onto the new ground. Each stroke is one undo step.
 fn sculpt(
     buttons: Res<ButtonInput<MouseButton>>,
     time: Res<Time>,
@@ -1147,16 +1397,21 @@ fn sculpt(
     let Some(Item::Terrain(kind)) = tool.item.filter(|_| project.mode == Mode::Build) else {
         return;
     };
-    if buttons.just_released(MouseButton::Left) && tool.stroking {
+    if tool.stroking && !buttons.pressed(MouseButton::Left) {
         tool.stroking = false;
         tool.flatten_to = None;
+        tool.last_dab = None;
         settle_loose_parts(&mut project);
+        project.mark_terrain();
         return;
     }
     let Some(p) = pointer.ground else { return };
     if buttons.just_pressed(MouseButton::Left) && !pointer.over_ui {
         tool.stroking = true;
+        tool.stroke_frames = 0;
+        tool.last_dab = None;
         let bounds = project.layout.bounds().grow(40.0);
+        // One undo step for the whole stroke.
         project.edit(&[], None, |layout| {
             if layout.terrain.is_none() {
                 layout.terrain = Some(Terrain::flat(
@@ -1165,49 +1420,90 @@ fn sculpt(
                 ));
             }
         });
+        tool.protect = protected_ground(&project.layout);
         tool.flatten_to = Some(project.layout.ground_at(p));
     }
-    if !tool.stroking || !buttons.pressed(MouseButton::Left) {
+    if !tool.stroking {
         return;
     }
-    let dt = time.delta_secs_f64().min(0.1);
+    let radius = tool.brush_radius;
+    let strength = tool.brush_strength;
     let brush = match kind {
         Sculpt::Raise => Brush::Raise,
         Sculpt::Lower => Brush::Lower,
         Sculpt::Flatten => Brush::Flatten(tool.flatten_to.unwrap_or(0.0)),
         Sculpt::Smooth => Brush::Smooth,
+        Sculpt::Sand => Brush::Sand,
     };
-    let strength = match kind {
-        Sculpt::Raise | Sculpt::Lower => tool.brush_strength * 3.0 * dt,
-        _ => (tool.brush_strength * 4.0 * dt).min(1.0),
+    // How much one dab does.
+    let per_dab = match kind {
+        Sculpt::Raise | Sculpt::Lower => strength * 0.12,
+        Sculpt::Sand => (strength * 0.35).min(1.0),
+        _ => (strength * 0.3).min(1.0),
     };
-    let radius = tool.brush_radius;
-    if project
-        .layout
-        .terrain
-        .as_mut()
-        .is_some_and(|t| t.brush(brush, p, radius, strength))
-    {
+    // Dabs every quarter radius along the path since the last one; while the pointer rests,
+    // the brush keeps working at a steady rate.
+    let spacing = (radius / 4.0).max(0.25);
+    let mut dabs: Vec<(P2, f64)> = Vec::new();
+    match tool.last_dab {
+        None => dabs.push((p, per_dab)),
+        Some(last) => {
+            let (dx, dz) = (p[0] - last[0], p[1] - last[1]);
+            let dist = (dx * dx + dz * dz).sqrt();
+            if dist >= spacing {
+                let steps = (dist / spacing).floor() as usize;
+                for k in 1..=steps.min(64) {
+                    let f = k as f64 * spacing / dist;
+                    dabs.push(([last[0] + dx * f, last[1] + dz * f], per_dab));
+                }
+            } else {
+                let dt = time.delta_secs_f64().min(0.1);
+                dabs.push((last, per_dab * dt * 8.0));
+            }
+        }
+    }
+    if let Some(&(at, _)) = dabs.last() {
+        tool.last_dab = Some(at);
+    }
+    let protect = std::mem::take(&mut tool.protect);
+    let mut changed = false;
+    if let Some(t) = project.layout.terrain.as_mut() {
+        for (at, amount) in dabs {
+            changed |= t.brush_masked(brush, at, radius, amount, &|q| brush_mask(&protect, q));
+        }
+    }
+    tool.protect = protect;
+    tool.stroke_frames += 1;
+    let every = if project.quality == crate::project::Quality::Low {
+        2
+    } else {
+        1
+    };
+    if changed && tool.stroke_frames.is_multiple_of(every) {
         project.mark_terrain();
     }
 }
 
-/// Puts trees, props and paths that belong to no building back onto the ground.
+/// Puts trees, props and paths that belong to no building back onto the ground, redrawing
+/// only the ground level.
 fn settle_loose_parts(project: &mut Project) {
     let Some(terrain) = project.layout.terrain.clone() else {
         return;
     };
-    project.edit(&[0], Some("settle"), |layout| {
-        for part in layout
-            .parts
-            .iter_mut()
-            .filter(|p| p.group.is_none() && p.level == 0)
+    for part in project
+        .layout
+        .parts
+        .iter_mut()
+        .filter(|p| p.group.is_none() && p.level == 0)
+    {
+        if matches!(&part.kind, PartKind::Area(a) if matches!(a.kind, AreaKind::Piazza | AreaKind::Tower | AreaKind::Platform))
         {
-            let c = part.footprint().center();
-            part.ground = terrain.height_at([c.0, c.1]);
+            continue;
         }
-    });
-    project.mark_all();
+        let c = part.footprint().center();
+        part.ground = terrain.height_at([c.0, c.1]);
+    }
+    project.mark(&[0]);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1257,10 +1553,34 @@ fn update_ghost(
 }
 
 fn draw_gizmos(mut gizmos: Gizmos, project: Res<Project>, tool: Res<Tool>, pointer: Res<Pointer>) {
+    let lift = 0.04;
+    if project.placing_piazza {
+        // The piazza to be: green where it fits, red over water or off the map.
+        if let Some(p) = pointer.ground.filter(|_| !pointer.over_ui) {
+            let fits = piazza_check(&project.layout, p, project.town.houses);
+            let r = urbanitas::piazza_rect(p, project.town.houses);
+            let colour = if fits.is_ok() {
+                Color::srgb(0.55, 0.85, 0.45)
+            } else {
+                Color::srgb(0.9, 0.3, 0.25)
+            };
+            for k in 0..3 {
+                let y = project.layout.ground_at(p) + lift + k as f64 * 0.6;
+                rect_outline(&mut gizmos, &r.grow(k as f64 * 0.5), y, colour);
+            }
+            let ring: Vec<Vec3> = (0..=40)
+                .map(|k| {
+                    let a = std::f64::consts::TAU * k as f64 / 40.0;
+                    let q = [p[0] + 2.5 * a.cos(), p[1] + 2.5 * a.sin()];
+                    v(q[0], project.layout.ground_at(q) + 0.3, q[1])
+                })
+                .collect();
+            gizmos.linestrip(ring, colour);
+        }
+    }
     if project.mode != Mode::Build {
         return;
     }
-    let lift = 0.04;
     if let Some(p) = pointer.ground {
         if let Some(Item::Terrain(_)) = tool.item {
             // The brush: a ring that follows the ground.
@@ -1307,6 +1627,58 @@ fn draw_gizmos(mut gizmos: Gizmos, project: Res<Project>, tool: Res<Tool>, point
                 0.12,
                 Color::srgb(0.71, 0.32, 0.23),
             );
+            if let (Some(Item::Street), Some(a)) = (tool.item, tool.drag_start) {
+                let b = street_end(a, marker);
+                let r = Rect::new(
+                    a[0].min(b[0]),
+                    a[1].min(b[1]),
+                    (a[0] - b[0]).abs(),
+                    (a[1] - b[1]).abs(),
+                )
+                .grow(2.5);
+                rect_outline(
+                    &mut gizmos,
+                    &r,
+                    pointer.height + lift,
+                    Color::srgb(0.71, 0.32, 0.23),
+                );
+            }
+            if let Some(Item::Design(index)) = tool.item {
+                if let Some(design) = project.designs.get(index) {
+                    let (w, d) = if tool.turns() % 2 == 1 {
+                        (design.lot.d, design.lot.w)
+                    } else {
+                        (design.lot.w, design.lot.d)
+                    };
+                    let r = Rect::new(marker[0] - w / 2.0, marker[1] - d / 2.0, w, d);
+                    rect_outline(
+                        &mut gizmos,
+                        &r,
+                        pointer.height + lift,
+                        Color::srgb(0.55, 0.85, 0.45),
+                    );
+                    // The front: the street side the copy will face.
+                    let front = match tool.turns() {
+                        0 => (
+                            v(r.x, pointer.height + 0.3, r.z),
+                            v(r.x1(), pointer.height + 0.3, r.z),
+                        ),
+                        1 => (
+                            v(r.x, pointer.height + 0.3, r.z),
+                            v(r.x, pointer.height + 0.3, r.z1()),
+                        ),
+                        2 => (
+                            v(r.x, pointer.height + 0.3, r.z1()),
+                            v(r.x1(), pointer.height + 0.3, r.z1()),
+                        ),
+                        _ => (
+                            v(r.x1(), pointer.height + 0.3, r.z),
+                            v(r.x1(), pointer.height + 0.3, r.z1()),
+                        ),
+                    };
+                    gizmos.line(front.0, front.1, Color::srgb(0.71, 0.32, 0.23));
+                }
+            }
             if tool.item == Some(Item::Building) {
                 let size = project.site.building.size;
                 let r = Rect::new(

@@ -237,6 +237,14 @@ impl Water {
         self.surface_near(p, 0.0).is_some_and(|s| ground < s)
     }
 
+    /// Raises (or with a negative `rise`, lowers) the water's surface.
+    pub fn shift(&mut self, rise: f64) {
+        self.level += rise;
+        for s in &mut self.surface {
+            *s += rise;
+        }
+    }
+
     /// The water surface, in [`Material::Water`].
     pub fn mesh(&self) -> MeshSet {
         let mut set = MeshSet::default();
@@ -337,7 +345,7 @@ pub fn ground_map(t: &Terrain, water: Option<&Water>) -> Vec<Ground> {
     let (lo, hi) = t.heights.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &h| {
         (lo.min(h as f64), hi.max(h as f64))
     });
-    // Only real mountains get scree on their tops.
+    // Only real mountains get scree, on their steeper tops (not on a flat cliff-top plateau).
     let scree_above = if hi - lo > 35.0 {
         hi - (hi - lo) * 0.22
     } else {
@@ -368,7 +376,7 @@ pub fn ground_map(t: &Terrain, water: Option<&Water>) -> Vec<Ground> {
                 Ground::Sand
             } else if grade > 1.1 {
                 Ground::Rock
-            } else if h > scree_above {
+            } else if h > scree_above && grade > 0.25 {
                 Ground::Scree
             } else if grade > 0.55 {
                 Ground::Earth

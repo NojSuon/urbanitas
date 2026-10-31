@@ -1,21 +1,34 @@
-//! The open project: site parameters, the editable layout, undo history and what needs redrawing.
+//! The open project: what it is generated from (a landscape with a town, or a site preset),
+//! the editable layout, the design library, undo history and what needs redrawing.
 
 use std::collections::BTreeSet;
 
 use bevy::prelude::*;
+use urbanitas::design::Design;
 use urbanitas::mesh::build::WallMode;
-use urbanitas::parts::{Layout, PartId};
+use urbanitas::parts::{Layout, P2, PartId};
 use urbanitas::style::{Palette, StyleProfile};
-use urbanitas::{SiteParams, generate_site};
+use urbanitas::{
+    LandscapeParams, SiteParams, TownParams, generate_site, grow_town, landscape_layout,
+};
 
 const HISTORY_LIMIT: usize = 60;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// Tweak parameters and watch the site regenerate.
+    /// Tweak parameters and watch the landscape, town or site regenerate.
     Generate,
     /// Edit the site part by part.
     Build,
+}
+
+/// What Generate builds the layout from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// A landscape, with a town grown round the piazza once one is placed.
+    Landscape,
+    /// One of the site presets (a single building, a street, villas, a farm).
+    Site,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,7 +57,16 @@ impl Quality {
 
 #[derive(Resource)]
 pub struct Project {
+    pub source: Source,
     pub site: SiteParams,
+    pub landscape: LandscapeParams,
+    pub town: TownParams,
+    /// Where the town's piazza is; no town until one is placed.
+    pub plaza: Option<P2>,
+    /// Clicking the map places the piazza.
+    pub placing_piazza: bool,
+    /// Saved house designs (the `designs/` folder).
+    pub designs: Vec<Design>,
     pub layout: Layout,
     pub error: Option<String>,
     pub mode: Mode,
@@ -55,8 +77,10 @@ pub struct Project {
     pub selected: Option<PartId>,
     /// A whole building selected (Shift+click).
     pub selected_group: Option<u32>,
+    /// A house opened for editing on its own: the others are hidden and can't be picked.
+    pub open_group: Option<u32>,
     pub status: String,
-    /// When a parameter change should regenerate the site (debounced).
+    /// When a parameter change should regenerate (debounced).
     pub regenerate_at: Option<f64>,
     /// Bumped on every change, so pictures of the selection can refresh.
     pub revision: u64,
@@ -70,7 +94,13 @@ pub struct Project {
 }
 
 impl Project {
-    pub fn new(site: SiteParams, quality: Quality) -> Self {
+    pub fn new(
+        source: Source,
+        site: SiteParams,
+        landscape: LandscapeParams,
+        town: TownParams,
+        quality: Quality,
+    ) -> Self {
         let style = site.building.style;
         let mut project = Self {
             layout: Layout::new(
@@ -78,7 +108,13 @@ impl Project {
                 StyleProfile::for_style(style),
                 Palette::choose(style, &mut urbanitas::rng::Rng::new(0)),
             ),
+            source,
             site,
+            landscape,
+            town,
+            plaza: None,
+            placing_piazza: false,
+            designs: crate::files::list_designs(),
             error: None,
             mode: Mode::Generate,
             level: 0,
@@ -86,6 +122,7 @@ impl Project {
             quality,
             selected: None,
             selected_group: None,
+            open_group: None,
             status: "Welcome to Urbanitas".into(),
             regenerate_at: None,
             revision: 0,
@@ -100,22 +137,76 @@ impl Project {
         project
     }
 
-    /// Rebuilds the layout from the site parameters. Undoable.
+    /// The layout Generate would build now.
+    fn generated(&self) -> Result<(Layout, String), String> {
+        match self.source {
+            Source::Site => generate_site(&self.site)
+                .map(|l| {
+                    let note = l.description.clone();
+                    (l, note)
+                })
+                .map_err(|e| e.to_string()),
+            Source::Landscape => {
+                let mut layout = landscape_layout(&self.landscape, self.town.style);
+                let note = match self.plaza {
+                    Some(plaza) => {
+                        let report = grow_town(&mut layout, plaza, &self.town, &self.designs)
+                            .map_err(|e| e.to_string())?;
+                        layout.name = format!("town_{}", self.town.seed);
+                        format!(
+                            "Town grown: {} houses on {} streets",
+                            report.houses, report.streets
+                        )
+                    }
+                    None => format!(
+                        "{} · {} · open the Town panel to place a piazza",
+                        self.landscape.relief.label(),
+                        self.landscape.water.label()
+                    ),
+                };
+                Ok((layout, note))
+            }
+        }
+    }
+
+    /// Rebuilds the layout from the current parameters. Undoable.
     pub fn regenerate(&mut self) {
-        match generate_site(&self.site) {
-            Ok(layout) => {
-                if !self.layout.parts.is_empty() {
+        match self.generated() {
+            Ok((layout, note)) => {
+                if !self.layout.parts.is_empty() || self.layout.terrain.is_some() {
                     self.snapshot(None);
                 }
                 self.layout = layout;
                 self.error = None;
                 self.selected = None;
                 self.selected_group = None;
+                self.open_group = None;
                 self.level = self.level.min(self.top_level());
+                self.status = note;
                 self.mark_all();
             }
-            Err(err) => self.error = Some(err.to_string()),
+            Err(err) => {
+                self.status = format!("Can't do that: {err}");
+                self.error = Some(err);
+            }
         }
+    }
+
+    /// Grows the town round a piazza at `plaza` (replacing any town already there).
+    pub fn grow_town_at(&mut self, plaza: P2) {
+        let previous = self.plaza.replace(plaza);
+        self.source = Source::Landscape;
+        self.regenerate();
+        if self.error.is_some() {
+            self.plaza = previous;
+        }
+    }
+
+    /// Removes the town, leaving the bare landscape.
+    pub fn clear_town(&mut self) {
+        self.plaza = None;
+        self.regenerate();
+        self.status = "Town cleared".into();
     }
 
     /// Replaces the layout (a loaded project or a new empty plot). Undoable.
@@ -124,6 +215,7 @@ impl Project {
         self.layout = layout;
         self.selected = None;
         self.selected_group = None;
+        self.open_group = None;
         self.level = 0;
         self.mark_all();
     }
@@ -185,11 +277,10 @@ impl Project {
         {
             self.selected = None;
         }
-        if self
-            .selected_group
-            .is_some_and(|g| self.layout.group_parts(g).next().is_none())
-        {
-            self.selected_group = None;
+        for group in [&mut self.selected_group, &mut self.open_group] {
+            if group.is_some_and(|g| self.layout.group_parts(g).next().is_none()) {
+                *group = None;
+            }
         }
         self.status = status.into();
         self.mark_all();
@@ -198,6 +289,14 @@ impl Project {
     /// Highest level holding any part (roofs included).
     pub fn top_level(&self) -> u32 {
         self.layout.parts.iter().map(|p| p.level).max().unwrap_or(0)
+    }
+
+    /// Every level a building's parts are on.
+    pub fn group_levels(&self, group: u32) -> Vec<u32> {
+        let mut levels: Vec<u32> = self.layout.group_parts(group).map(|p| p.level).collect();
+        levels.sort_unstable();
+        levels.dedup();
+        levels
     }
 
     pub fn mark_all(&mut self) {

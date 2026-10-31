@@ -1,5 +1,5 @@
-//! Pictures of parts: a small render of every catalogue item, and a larger one of whatever
-//! is selected, painted off-screen one at a time and shown in the HUD.
+//! Pictures of parts: a small render of every catalogue item and saved design, and a larger
+//! one of whatever is selected, painted off-screen one at a time and shown in the HUD.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -11,16 +11,17 @@ use bevy::render::render_resource::{
 };
 use bevy::render::view::Msaa;
 use bevy_egui::{EguiTextureHandle, EguiUserTextures, egui};
+use urbanitas::design::Design;
 use urbanitas::geometry::Rect;
 use urbanitas::mesh::build::{Scene, View};
 use urbanitas::model::{OpeningKind, Roof};
 use urbanitas::parts::*;
 use urbanitas::style::OpeningSpec;
 use urbanitas::terrain::{Brush, Terrain};
-use urbanitas::{BuildingParams, Garden, Size, generate};
+use urbanitas::{BuildingParams, Garden, Size, TownParams, fill_street, generate};
 
 use crate::project::Project;
-use crate::scene::{MaterialCache, bevy_mesh};
+use crate::scene::{MainCamera, MaterialCache, bevy_mesh};
 use crate::tools::{Item, Sculpt, Tool};
 
 /// The render layer the picture cameras and models live on, away from the main view.
@@ -28,7 +29,8 @@ const LAYER: usize = 7;
 const THUMB: u32 = 112;
 const PREVIEW: (u32, u32) = (264, 168);
 /// Frames to keep a job on screen before reading it as done.
-const FRAMES: u32 = 3;
+/// (Long enough for the GPU to have the job's meshes and pipelines ready.)
+const FRAMES: u32 = 6;
 
 pub struct ThumbsPlugin;
 
@@ -40,10 +42,17 @@ impl Plugin for ThumbsPlugin {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Key {
     Item(Item),
+    /// A saved design, by `design_key`.
+    Design(String),
     Preview,
+}
+
+/// Names a design's picture; it changes when the design does.
+fn design_key(design: &Design) -> String {
+    format!("{}:{}", design.id, design.to_json().len())
 }
 
 #[derive(Resource, Default)]
@@ -55,6 +64,9 @@ pub struct Thumbs {
     painted_for: Option<String>,
     /// What the preview shows, and when it was last painted.
     preview_of: Option<(Option<PartId>, Option<u32>, u64)>,
+    /// The first pictures can come out blank while the GPU is still compiling shaders,
+    /// so once the first pass is done everything is painted once more.
+    repainted: bool,
 }
 
 struct Job {
@@ -67,6 +79,10 @@ struct Job {
 impl Thumbs {
     pub fn item(&self, item: Item) -> Option<egui::TextureId> {
         self.ready.get(&Key::Item(item)).copied()
+    }
+
+    pub fn design(&self, design: &Design) -> Option<egui::TextureId> {
+        self.ready.get(&Key::Design(design_key(design))).copied()
     }
 
     pub fn preview(&self) -> Option<egui::TextureId> {
@@ -294,6 +310,7 @@ fn sample(item: Item, project: &Project) -> Layout {
                 Sculpt::Lower => Brush::Lower,
                 Sculpt::Flatten => Brush::Flatten(0.0),
                 Sculpt::Smooth => Brush::Smooth,
+                Sculpt::Sand => Brush::Sand,
             };
             if matches!(sculpt, Sculpt::Flatten | Sculpt::Smooth) {
                 t = Terrain::generate(rect(16.0, 16.0), 0.5, 1.5, 0.0, 3);
@@ -309,6 +326,23 @@ fn sample(item: Item, project: &Project) -> Layout {
                 },
             );
             layout.terrain = Some(t);
+        }
+        Item::Street => {
+            layout.terrain = Some(Terrain::flat(rect(60.0, 60.0), 1.0));
+            let params = TownParams {
+                houses: 4,
+                style: style.style,
+                density: 1.0,
+                seed: 5,
+                ..TownParams::default()
+            };
+            fill_street(&mut layout, [-16.0, 0.0], [16.0, 0.0], &params, &[]);
+            layout.terrain = None;
+        }
+        Item::Design(index) => {
+            if let Some(design) = project.designs.get(index) {
+                design.place(&mut layout, [0.0, 0.0], 0, 0.0, false);
+            }
         }
         Item::Building => {
             let params = BuildingParams {
@@ -372,6 +406,7 @@ fn run(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut user_textures: ResMut<EguiUserTextures>,
     tool: Res<Tool>,
+    main_msaa: Query<&Msaa, With<MainCamera>>,
 ) {
     // Repaint everything when the style or colours change.
     let style_key = format!(
@@ -409,6 +444,16 @@ fn run(
         thumbs.ready.insert(job.key, id);
     }
 
+    // Saved designs that have no picture yet.
+    for design in &project.designs {
+        let key = Key::Design(design_key(design));
+        if !thumbs.ready.contains_key(&key)
+            && !thumbs.queue.contains(&key)
+            && thumbs.active.as_ref().is_none_or(|j| j.key != key)
+        {
+            thumbs.queue.push_back(key);
+        }
+    }
     // Paint the category on show first.
     let showing = Item::catalogue(tool.category);
     if let Some(i) = thumbs
@@ -421,18 +466,43 @@ fn run(
             thumbs.queue.push_front(key);
         }
     }
+    if thumbs.queue.is_empty()
+        && thumbs.active.is_none()
+        && !thumbs.repainted
+        && !thumbs.ready.is_empty()
+    {
+        thumbs.repainted = true;
+        let mut again: Vec<Key> = thumbs.ready.keys().cloned().collect();
+        again.retain(|k| *k != Key::Preview);
+        thumbs.queue.extend(again);
+        if thumbs.ready.contains_key(&Key::Preview) {
+            thumbs.queue.push_front(Key::Preview);
+        }
+    }
     let Some(key) = thumbs.queue.pop_front() else {
         return;
     };
-    let layout = match key {
-        Key::Item(item) => sample(item, &project),
+    let layout = match &key {
+        Key::Item(item) => sample(*item, &project),
+        Key::Design(name) => {
+            let Some(design) = project.designs.iter().find(|d| design_key(d) == *name) else {
+                return;
+            };
+            let mut layout = Layout::new(
+                "design",
+                project.layout.style.clone(),
+                design.palette.clone(),
+            );
+            design.place(&mut layout, [0.0, 0.0], 0, 0.0, false);
+            layout
+        }
         Key::Preview => match selection(&project) {
             Some(l) => l,
             None => return,
         },
     };
     let size = match key {
-        Key::Item(_) => (THUMB, THUMB),
+        Key::Item(_) | Key::Design(_) => (THUMB, THUMB),
         Key::Preview => PREVIEW,
     };
     let image = images.add(target(size));
@@ -492,7 +562,8 @@ fn run(
                     ..default()
                 },
                 RenderTarget::Image(image.clone().into()),
-                Msaa::Off,
+                // The main view's anti-aliasing, so pictures reuse its compiled pipelines.
+                main_msaa.single().copied().unwrap_or(Msaa::Off),
                 Transform::from_translation(eye).looking_at(centre, Vec3::Y),
                 layer,
             ))

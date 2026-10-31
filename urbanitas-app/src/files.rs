@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use urbanitas::ArchitectureStyle;
+use urbanitas::design::Design;
 use urbanitas::export::{obj, svg};
 use urbanitas::geometry::Rect;
 use urbanitas::parts::{AreaKind, AreaPart, Layout, PartKind};
@@ -103,4 +104,49 @@ pub fn export(layout: &Layout, format: Export, texture_size: u32) -> io::Result<
         )?,
     }
     Ok(dir)
+}
+
+pub const DESIGNS_DIR: &str = "designs";
+const DESIGN_SUFFIX: &str = ".design.json";
+
+/// Saves a house design into `designs/<id>.design.json`.
+pub fn save_design(design: &Design) -> io::Result<PathBuf> {
+    fs::create_dir_all(DESIGNS_DIR)?;
+    let path = Path::new(DESIGNS_DIR).join(format!("{}{DESIGN_SUFFIX}", file_stem(&design.id)));
+    fs::write(&path, design.to_json())?;
+    Ok(path)
+}
+
+/// Every saved design, sorted by name (files that fail to load are skipped).
+pub fn list_designs() -> Vec<Design> {
+    let Ok(entries) = fs::read_dir(DESIGNS_DIR) else {
+        return Vec::new();
+    };
+    let mut designs: Vec<Design> = entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.to_string_lossy().ends_with(DESIGN_SUFFIX))
+        .filter_map(|p| Design::from_json(&fs::read_to_string(p).ok()?).ok())
+        .collect();
+    designs.sort_by(|a, b| a.name.cmp(&b.name));
+    designs
+}
+
+pub fn delete_design(id: &str) -> io::Result<()> {
+    fs::remove_file(Path::new(DESIGNS_DIR).join(format!("{}{DESIGN_SUFFIX}", file_stem(id))))
+}
+
+/// A design id from its name that no saved design uses yet.
+pub fn new_design_id(name: &str, taken: &[Design]) -> String {
+    let base = match urbanitas::design::slug(name) {
+        s if s.is_empty() => "house".to_string(),
+        s => s,
+    };
+    let mut id = base.clone();
+    let mut n = 2;
+    while taken.iter().any(|d| d.id == id) {
+        id = format!("{base}-{n}");
+        n += 1;
+    }
+    id
 }

@@ -55,6 +55,8 @@ pub struct MainCamera;
 #[derive(Component)]
 pub struct LevelMesh {
     pub level: u32,
+    /// The house it belongs to, if any.
+    pub group: Option<u32>,
 }
 
 #[derive(Component)]
@@ -90,8 +92,59 @@ impl SceneStats {
     }
 }
 
+/// The grey every palette texture is painted in before tinting.
+const NEUTRAL: u8 = 200;
+
+fn neutral_palette() -> Palette {
+    let grey = urbanitas::style::Color(NEUTRAL, NEUTRAL, NEUTRAL);
+    Palette {
+        name: "neutral".into(),
+        walls: grey,
+        trim: grey,
+        roof: grey,
+        stone: grey,
+    }
+}
+
+/// The base colour (sRGB, 0–1) a palette material's texture is built around, mirroring
+/// `texture::generate`.
+fn palette_base(material: Material, palette: &Palette) -> [f32; 3] {
+    let c =
+        |c: urbanitas::style::Color| [c.0 as f32 / 255.0, c.1 as f32 / 255.0, c.2 as f32 / 255.0];
+    let mix = |a: [f32; 3], b: [f32; 3], t: f32| {
+        [
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+        ]
+    };
+    match material {
+        Material::Plaster => c(palette.walls),
+        Material::Rustication => mix(c(palette.stone), c(palette.walls), 0.35),
+        Material::Shutter | Material::Door => c(palette.trim),
+        Material::RoofTile => c(palette.roof),
+        Material::Slabs => mix(c(palette.stone), [0.72, 0.68, 0.6], 0.5),
+        _ => c(palette.stone),
+    }
+}
+
+/// The tint that turns the neutral texture into `palette`'s colour (linear, may exceed 1).
+fn palette_tint(material: Material, palette: &Palette) -> LinearRgba {
+    let want = palette_base(material, palette);
+    let have = palette_base(material, &neutral_palette());
+    let lin = |v: f32| Color::srgb(v, v, v).to_linear().red;
+    LinearRgba::new(
+        lin(want[0]) / lin(have[0]),
+        lin(want[1]) / lin(have[1]),
+        lin(want[2]) / lin(have[2]),
+        1.0,
+    )
+}
+
 #[derive(Resource, Default)]
 pub struct MaterialCache {
+    /// One texture per material and size.
+    images: HashMap<(Material, u32), Handle<Image>>,
     materials: HashMap<(Material, String, u32), Handle<StandardMaterial>>,
     terrain: Option<(u32, Handle<StandardMaterial>)>,
     water: Option<(u32, Handle<StandardMaterial>)>,
@@ -107,22 +160,33 @@ impl MaterialCache {
         materials: &mut Assets<StandardMaterial>,
     ) -> Handle<StandardMaterial> {
         let size = quality.texture_size();
-        // Only some materials take the palette's colours; the rest are shared by every building.
-        let tint = if material.uses_palette() {
-            format!(
-                "{:?}",
-                (palette.walls, palette.trim, palette.roof, palette.stone)
-            )
-        } else {
-            String::new()
+        // Materials that take a palette's colours share one texture painted in a neutral
+        // grey; each building's colour is a tint on the material, so a town of thirty houses
+        // needs eight textures rather than two hundred.
+        let tint = material
+            .uses_palette()
+            .then(|| palette_tint(material, palette));
+        let key = tint.map_or(String::new(), |t| format!("{t:?}"));
+        let image = match self.images.get(&(material, size)) {
+            Some(image) => image.clone(),
+            None => {
+                let reference = if material.uses_palette() {
+                    &neutral_palette()
+                } else {
+                    palette
+                };
+                let tex = texture::generate(material, reference, size);
+                let image = images.add(make_image(&tex, quality));
+                self.images.insert((material, size), image.clone());
+                image
+            }
         };
         self.materials
-            .entry((material, tint, size))
+            .entry((material, key, size))
             .or_insert_with(|| {
-                let tex = texture::generate(material, palette, size);
-                let image = images.add(make_image(&tex, quality));
                 let (roughness, metallic) = material.surface();
                 materials.add(StandardMaterial {
+                    base_color: tint.map_or(Color::WHITE, Color::LinearRgba),
                     base_color_texture: Some(image),
                     perceptual_roughness: roughness,
                     metallic,
@@ -292,8 +356,31 @@ pub fn terrain_mesh(t: &Terrain, water: Option<&Water>, stride: usize) -> (Mesh,
             positions.push([p[0] as f32, y as f32, p[1] as f32]);
             normals.push(n.to_array());
             uvs.push([p[0] as f32 / 2.0, -(p[1] as f32) / 2.0]);
-            let [r, g, b] = ground[j * (t.cols + 1) + i].colour();
-            let c = Color::srgb(r, g, b).to_linear();
+            // The ground kinds of the neighbouring points blend, so edges are soft.
+            let mut sum = [0.0f32; 3];
+            let mut weight = 0.0;
+            for (di, dj, w) in [
+                (0i64, 0i64, 4.0f32),
+                (-1, 0, 1.0),
+                (1, 0, 1.0),
+                (0, -1, 1.0),
+                (0, 1, 1.0),
+                (-1, -1, 0.5),
+                (1, -1, 0.5),
+                (-1, 1, 0.5),
+                (1, 1, 0.5),
+            ] {
+                let (ni, nj) = (i as i64 + di * stride as i64, j as i64 + dj * stride as i64);
+                if ni < 0 || nj < 0 || ni as usize > t.cols || nj as usize > t.rows {
+                    continue;
+                }
+                let c = ground[nj as usize * (t.cols + 1) + ni as usize].colour();
+                for k in 0..3 {
+                    sum[k] += c[k] * w;
+                }
+                weight += w;
+            }
+            let c = Color::srgb(sum[0] / weight, sum[1] / weight, sum[2] / weight).to_linear();
             colors.push([c.red, c.green, c.blue, 1.0]);
         }
     }
@@ -341,7 +428,11 @@ impl Default for CameraStart {
 
 /// A camera framing that takes in the whole layout.
 pub fn framing(project: &Project) -> (Vec3, f32) {
-    let bounds = project.layout.bounds();
+    // The buildings if there are any, otherwise the middle of the landscape.
+    let bounds = match (&project.layout.terrain, project.layout.parts.is_empty()) {
+        (Some(t), true) => t.rect.grow(-t.rect.w * 0.3),
+        _ => project.layout.bounds(),
+    };
     let (cx, cz) = bounds.center();
     let ground = project.layout.ground_at([cx, cz]) as f32;
     let span = bounds.w.max(bounds.d) as f32;
@@ -482,7 +573,7 @@ fn rebuild(
                     Mesh3d(meshes.add(bevy_mesh(data))),
                     MeshMaterial3d(handle),
                     Transform::default(),
-                    LevelMesh { level },
+                    LevelMesh { level, group },
                 ));
             }
         }
@@ -541,7 +632,15 @@ fn rebuild_terrain(
 
 fn level_visibility(project: Res<Project>, mut meshes: Query<(&LevelMesh, &mut Visibility)>) {
     for (mesh, mut visibility) in &mut meshes {
-        let show = project.mode == Mode::Generate || mesh.level <= project.level;
+        // An opened house is shown on its own (with the ground and loose parts round it).
+        let others_hidden = project
+            .open_group
+            .is_some_and(|g| mesh.group.is_some_and(|m| m != g));
+        // Upper floors drop away only while you work above the ground or inside an opened house.
+        let clipped = project.mode == Mode::Build
+            && (project.level > 0 || project.open_group.is_some())
+            && mesh.level > project.level;
+        let show = !others_hidden && !clipped;
         let wanted = if show {
             Visibility::Inherited
         } else {

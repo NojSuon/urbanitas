@@ -1,5 +1,6 @@
-//! Urbanitas, the interactive app: generate a building or a whole neighbourhood live from
-//! parameters, then edit it part by part in a Sims-style build mode. By Noj Suon.
+//! Urbanitas, the interactive app: generate a landscape, grow a town round a piazza (or pick
+//! a site preset), then edit it house by house and part by part in a Sims-style build mode.
+//! By Noj Suon.
 
 mod capture;
 mod files;
@@ -20,10 +21,12 @@ use clap::{Parser, ValueEnum};
 use urbanitas::mesh::build::WallMode;
 use urbanitas::parts::{OpeningPart, PartKind};
 use urbanitas::{
-    ArchitectureStyle, BuildingParams, BuildingType, Context, Garden, Shape, SiteParams, Size,
+    ArchitectureStyle, BuildingParams, BuildingType, Context, DesignMix, Garden, LandscapeParams,
+    Relief, Shape, SiteParams, Size, TownParams, WaterBody, suggest_piazza,
 };
 
-use project::{Mode, Project, Quality};
+use hud::{HudState, Panel};
+use project::{Mode, Project, Quality, Source};
 use tools::{Category, Item, Pointer, Sculpt, Tool};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -38,14 +41,34 @@ enum Demo {
     Build,
     /// Build mode with the terrain brushes and a hill raised next to the buildings.
     Terrain,
+    /// The town panel, with the ghost piazza under the pointer.
+    Piazza,
+    /// A house selected, its card floating beside it.
+    House,
+    /// The design library, with the selected house saved (in memory only) and a copy
+    /// about to be placed.
+    Designs,
 }
 
 /// Urbanitas: procedural architecture you can edit.
 #[derive(Parser, Debug)]
 #[command(name = "urbanitas-app", version, author = "Noj Suon")]
 struct Args {
-    #[arg(long, value_enum, default_value_t = Context::Single)]
-    context: Context,
+    /// Start from a site preset instead of a landscape.
+    #[arg(long, value_enum)]
+    context: Option<Context>,
+    /// The landscape's relief.
+    #[arg(long, value_enum, default_value_t = Relief::Hills)]
+    landscape: Relief,
+    /// The landscape's body of water.
+    #[arg(long, value_enum, default_value_t = WaterBody::Beach)]
+    water: WaterBody,
+    /// Side of the landscape's map, in metres.
+    #[arg(long, default_value_t = 320.0)]
+    map_size: f64,
+    /// Houses in the town grown on the landscape at start (0 for bare land).
+    #[arg(long, default_value_t = 24)]
+    town: u32,
     /// Buildings in an urban or suburban site.
     #[arg(long, default_value_t = 6)]
     buildings: u32,
@@ -99,7 +122,7 @@ struct Args {
 fn main() -> AppExit {
     let args = Args::parse();
     let site = SiteParams {
-        context: args.context,
+        context: args.context.unwrap_or(Context::Single),
         buildings: args.buildings,
         relief: args.relief,
         building: BuildingParams {
@@ -120,14 +143,52 @@ fn main() -> AppExit {
         QualityArg::Low => Quality::Low,
         QualityArg::High => Quality::High,
     };
-    let mut project = Project::new(site, quality);
+    let landscape = LandscapeParams {
+        relief: args.landscape,
+        water: args.water,
+        size: args.map_size,
+        seed: args.seed,
+    };
+    let town = TownParams {
+        style: args.style,
+        houses: args.town.max(4),
+        density: 0.6,
+        seed: args.seed,
+        mix: DesignMix::Generated,
+    };
+    let source = if args.context.is_some() {
+        Source::Site
+    } else {
+        Source::Landscape
+    };
+    let mut project = Project::new(source, site, landscape, town, quality);
+    let mut hud_state = HudState::default();
+    if source == Source::Landscape && args.town > 0 {
+        if let Some(plaza) = suggest_piazza(&project.layout) {
+            project.grow_town_at(plaza);
+        }
+        hud_state.panel = Some(Panel::Town);
+    }
     let mut tool = Tool::default();
     let mut pointer = Pointer::default();
     match args.demo {
         Some(Demo::Build) => stage_build_demo(&mut project, &mut tool, &mut pointer),
         Some(Demo::Terrain) => stage_terrain_demo(&mut project, &mut tool, &mut pointer),
+        Some(Demo::Piazza) => stage_piazza_demo(&mut project, &mut pointer),
+        Some(Demo::House) => stage_house_demo(&mut project),
+        Some(Demo::Designs) => {
+            stage_house_demo(&mut project);
+            stage_designs_demo(&mut project, &mut tool, &mut pointer);
+        }
         None => {}
     }
+    hud_state.panel = match args.demo {
+        Some(Demo::Build) => Some(Panel::Build),
+        Some(Demo::Terrain) | Some(Demo::House) => None,
+        Some(Demo::Piazza) => Some(Panel::Town),
+        Some(Demo::Designs) => Some(Panel::Designs),
+        None => hud_state.panel,
+    };
 
     let mut app = App::new();
     app.add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -146,6 +207,7 @@ fn main() -> AppExit {
     .add_plugins(EguiPlugin::default())
     .add_plugins(PanOrbitCameraPlugin)
     .insert_resource(project)
+    .insert_resource(hud_state)
     .insert_resource(tool)
     .insert_resource(pointer)
     .insert_resource(scene::CameraStart {
@@ -211,9 +273,59 @@ fn stage_terrain_demo(project: &mut Project, tool: &mut Tool, pointer: &mut Poin
         }
     });
     project.mark_all();
-    tool.category = Category::Terrain;
     tool.pick(Some(Item::Terrain(Sculpt::Raise)));
     tool.brush_radius = 9.0;
     pointer.forced = Some(hill);
     project.status = "Demo: raising a hill".into();
+}
+
+/// The town panel open and the ghost piazza under the pointer, beside the town.
+fn stage_piazza_demo(project: &mut Project, pointer: &mut Pointer) {
+    project.mode = Mode::Generate;
+    project.placing_piazza = true;
+    let at = project.plaza.unwrap_or([0.0, 0.0]);
+    pointer.forced = Some([at[0] + 70.0, at[1] + 30.0]);
+    project.status = "Demo: placing a piazza".into();
+}
+
+/// Build mode with the largest house near the piazza selected.
+fn stage_house_demo(project: &mut Project) {
+    project.mode = Mode::Build;
+    let plaza = project.plaza.unwrap_or([0.0, 0.0]);
+    let near = (0..project.layout.palettes.len() as u32)
+        .filter_map(|g| {
+            project
+                .layout
+                .module(g)
+                .and_then(|m| m.lot)
+                .map(|lot| (g, lot))
+        })
+        .min_by(|a, b| {
+            let d = |r: &urbanitas::geometry::Rect| {
+                let (x, z) = r.center();
+                (x - plaza[0]).hypot(z - plaza[1])
+            };
+            d(&a.1).total_cmp(&d(&b.1))
+        });
+    project.selected_group = near.map(|(g, _)| g);
+    project.status = "Demo: a house selected".into();
+    project.mark_all();
+}
+
+/// Saves the selected house as a design (in memory, not to disk), then arms a copy of it.
+fn stage_designs_demo(project: &mut Project, tool: &mut Tool, pointer: &mut Pointer) {
+    let Some(group) = project.selected_group else {
+        return;
+    };
+    if let Some(design) =
+        urbanitas::design::Design::capture(&project.layout, group, "demo-palazzo", "Palazzo demo")
+    {
+        project.layout.module_mut(group).design = Some(design.id.clone());
+        project.designs.insert(0, design);
+    }
+    tool.pick(Some(Item::Design(0)));
+    tool.yaw = -std::f64::consts::FRAC_PI_2;
+    let plaza = project.plaza.unwrap_or([0.0, 0.0]);
+    pointer.forced = Some([plaza[0] - 60.0, plaza[1] + 10.0]);
+    project.status = "Demo: placing a copy of a saved design".into();
 }

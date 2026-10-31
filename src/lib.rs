@@ -43,4 +43,6 @@ pub use params::{
 };
 pub use parts::{Layout, Part, PartKind};
 pub use site::{Context, SiteParams, generate_site};
-pub use town::{DesignMix, TownParams, fill_street, grow_town, suggest_piazza};
+pub use town::{
+    DesignMix, TownParams, fill_street, grow_town, piazza_check, piazza_rect, suggest_piazza,
+};
