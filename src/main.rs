@@ -18,7 +18,7 @@ enum Format {
     Obj,
     /// One floor plan per floor (.svg).
     Svg,
-    /// The full building model (.json).
+    /// The building as an app project file (.urbanitas.json).
     Json,
 }
 
@@ -62,6 +62,18 @@ struct Cli {
     /// Base file name for the outputs. Defaults to urbanitas_<type>_<seed>.
     #[arg(long)]
     name: Option<String>,
+    /// Size of the OBJ's PNG textures, in pixels (a power of two).
+    #[arg(long, default_value_t = 512, value_parser = texture_size)]
+    texture_size: u32,
+}
+
+fn texture_size(text: &str) -> Result<u32, String> {
+    let size: u32 = text.parse().map_err(|e| format!("{e}"))?;
+    if size.is_power_of_two() && (16..=2048).contains(&size) {
+        Ok(size)
+    } else {
+        Err("must be a power of two between 16 and 2048".into())
+    }
 }
 
 fn main() -> ExitCode {
@@ -98,24 +110,24 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| building.name.clone());
 
+    let layout = building.to_layout();
+
     fs::create_dir_all(&cli.out)?;
     let mut written = Vec::new();
     if cli.format.contains(&Format::Obj) {
         let path = cli.out.join(format!("{stem}.obj"));
-        obj::write_obj(&building, &path)?;
-        written.push(path.with_extension("mtl"));
-        written.push(path);
+        written.extend(obj::write_obj(&layout, &path, cli.texture_size)?);
     }
     if cli.format.contains(&Format::Svg) {
-        for floor in &building.floors {
-            let path = cli.out.join(format!("{stem}_floor{}.svg", floor.level));
-            fs::write(&path, svg::floor_plan_svg(&building, floor))?;
+        for level in 0..layout.levels() {
+            let path = cli.out.join(format!("{stem}_floor{level}.svg"));
+            fs::write(&path, svg::floor_plan_svg(&layout, level))?;
             written.push(path);
         }
     }
     if cli.format.contains(&Format::Json) {
-        let path = cli.out.join(format!("{stem}.json"));
-        fs::write(&path, json::to_json(&building))?;
+        let path = cli.out.join(format!("{stem}.urbanitas.json"));
+        fs::write(&path, json::layout_to_json(&layout))?;
         written.push(path);
     }
 

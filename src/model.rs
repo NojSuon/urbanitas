@@ -141,6 +141,20 @@ pub enum OpeningKind {
     Door,
     BalconyDoor,
     Storefront,
+    /// An open, doorless passage between rooms.
+    Archway,
+}
+
+impl OpeningKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            OpeningKind::Window => "Window",
+            OpeningKind::Door => "Front door",
+            OpeningKind::BalconyDoor => "Balcony door",
+            OpeningKind::Storefront => "Storefront",
+            OpeningKind::Archway => "Archway",
+        }
+    }
 }
 
 /// An opening in an exterior wall. `center` is measured along the side's axis.
@@ -246,11 +260,16 @@ pub enum FeatureKind {
     CypressTree,
     LemonTree,
     Pot,
+    /// A columned, arcaded porch.
+    Loggia,
+    Fountain,
 }
 
 impl FeatureKind {
     pub fn label(self) -> &'static str {
         match self {
+            FeatureKind::Loggia => "loggia",
+            FeatureKind::Fountain => "fountain",
             FeatureKind::Path => "path",
             FeatureKind::Terrace => "terrace",
             FeatureKind::Pool => "pool",

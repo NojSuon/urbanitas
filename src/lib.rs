@@ -12,18 +12,24 @@
 //! use urbanitas::{generate, BuildingParams};
 //!
 //! let building = generate(&BuildingParams::default()).unwrap();
-//! let obj = urbanitas::export::obj::to_obj(&building, "house.mtl");
-//! assert!(obj.obj.contains("usemtl wall"));
+//! let layout = building.to_layout();
+//! let obj = urbanitas::export::obj::to_obj(&layout, "house.mtl", "house");
+//! assert!(obj.obj.contains("usemtl plaster"));
 //! ```
 
 pub mod export;
 pub mod generate;
 pub mod geometry;
+pub mod layout;
+pub mod mesh;
 pub mod model;
 pub mod params;
+pub mod parts;
 pub mod rng;
 pub mod style;
+pub mod texture;
 
 pub use generate::generate;
 pub use model::Building;
 pub use params::{ArchitectureStyle, BuildingParams, BuildingType, Garden, ParamError, Size};
+pub use parts::{Layout, Part, PartKind};

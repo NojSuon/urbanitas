@@ -54,7 +54,7 @@ pub fn generate(params: &BuildingParams) -> Result<Building, ParamError> {
 
 fn choose_roof(params: &BuildingParams, style: &StyleProfile, rng: &mut Rng) -> Roof {
     let flat = match params.building_type {
-        BuildingType::Apartment | BuildingType::Shop => true,
+        BuildingType::Apartment | BuildingType::Shop => style.flat_roof_chance > 0.0,
         BuildingType::Villa => false,
         BuildingType::House => rng.chance(style.flat_roof_chance),
     };
@@ -421,7 +421,8 @@ fn place_openings(
                             room: index,
                         });
                     }
-                    let half = spec.width / 2.0 + 0.3;
+                    // `spread` keeps the other half of the gap.
+                    let half = spec.width / 2.0 + style.window_gap / 2.0;
                     free = vec![(a, center - half), (center + half, b)];
                 }
             }
@@ -458,9 +459,12 @@ fn opening(kind: OpeningKind, side: Side, center: f64, spec: OpeningSpec, room: 
 }
 
 /// Centres for as many `width`-wide openings as fit in `lo..hi`, evenly spaced
-/// and at least `gap` apart.
+/// and at least `gap` apart. Each end keeps half a gap clear, so openings in
+/// neighbouring stretches of wall also end up a full gap apart (room for shutters
+/// and stone frames).
 fn spread(lo: f64, hi: f64, width: f64, gap: f64) -> Vec<f64> {
-    let usable = hi - lo - 2.0 * CORNER_CLEARANCE;
+    let margin = CORNER_CLEARANCE.max(gap / 2.0);
+    let usable = hi - lo - 2.0 * margin;
     if usable < width {
         return Vec::new();
     }
@@ -468,7 +472,7 @@ fn spread(lo: f64, hi: f64, width: f64, gap: f64) -> Vec<f64> {
     if count == 1 {
         return vec![(lo + hi) / 2.0];
     }
-    let first = lo + CORNER_CLEARANCE + width / 2.0;
+    let first = lo + margin + width / 2.0;
     let step = (usable - width) / (count - 1) as f64;
     (0..count).map(|i| first + step * i as f64).collect()
 }
@@ -485,6 +489,7 @@ fn plan_garden(
         Garden::Back => (2.0, 8.0, 1.5),
         Garden::Surrounding => (6.0, 8.0, 5.0),
     };
+    let style = StyleProfile::for_style(params.style);
     let lot = footprint.expand(sides, south, sides, north);
     let mut features = Vec::new();
     fn add(features: &mut Vec<GardenFeature>, kind: FeatureKind, rect: Rect, height: f64) -> Rect {
@@ -532,7 +537,21 @@ fn plan_garden(
         add(&mut features, FeatureKind::Pool, pool, 1.4);
     }
 
-    if let Some(terrace) = terrace {
+    if let (Some(terrace), true) = (terrace, style.loggia) {
+        let width = (footprint.w * 0.6).clamp(4.0, 9.0).min(footprint.w);
+        let loggia = Rect::new(
+            footprint.x + (footprint.w - width) / 2.0,
+            terrace.z,
+            width,
+            2.6,
+        );
+        add(
+            &mut features,
+            FeatureKind::Loggia,
+            loggia,
+            style.floor_height,
+        );
+    } else if let Some(terrace) = terrace {
         if rng.chance(0.6) {
             let width = (footprint.w * 0.45).clamp(2.5, 5.0);
             let x = if rng.chance(0.5) {
@@ -546,6 +565,23 @@ fn plan_garden(
                 Rect::new(x, terrace.z + 0.1, width, terrace.d - 0.2),
                 2.6,
             );
+        }
+    }
+
+    if let (Some(door), true) = (doors.first(), style.fountain && south >= 6.0) {
+        // On the roomier side of the front path.
+        let x = if door.center - footprint.x > footprint.x1() - door.center {
+            (footprint.x + door.center) / 2.0
+        } else {
+            (door.center + footprint.x1()) / 2.0
+        };
+        let fountain = Rect::new(x - 1.0, footprint.z - 4.4, 2.0, 2.0);
+        if lot.contains(&fountain)
+            && !features
+                .iter()
+                .any(|f| f.rect.grow(0.3).intersects(&fountain))
+        {
+            add(&mut features, FeatureKind::Fountain, fountain, 1.5);
         }
     }
 

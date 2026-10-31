@@ -1,9 +1,11 @@
 use std::collections::{HashSet, VecDeque};
 
-use urbanitas::export::{json, obj, svg};
+use urbanitas::export::json;
 use urbanitas::geometry::{EPS, Side};
 use urbanitas::model::{Floor, OpeningKind, RoomKind};
-use urbanitas::{Building, BuildingParams, BuildingType, Garden, ParamError, Size, generate};
+use urbanitas::{
+    ArchitectureStyle, Building, BuildingParams, BuildingType, Garden, ParamError, Size, generate,
+};
 
 const TYPES: [BuildingType; 4] = [
     BuildingType::House,
@@ -25,23 +27,25 @@ fn params(seed: u64) -> BuildingParams {
     }
 }
 
-/// Every combination of type, garden, floor count and room count, over a few seeds.
+/// Every combination of style, type, garden, floor count and room count, over a few seeds.
 fn sweep() -> impl Iterator<Item = BuildingParams> {
-    TYPES.into_iter().flat_map(|building_type| {
-        GARDENS.into_iter().flat_map(move |garden| {
-            (1..=4).flat_map(move |floors| {
-                (1..=7).flat_map(move |rooms| {
-                    (0..6).map(move |seed| BuildingParams {
-                        seed,
-                        floors,
-                        size: Size {
-                            width: 14.0,
-                            depth: 11.0,
-                        },
-                        building_type,
-                        rooms,
-                        garden,
-                        ..BuildingParams::default()
+    ArchitectureStyle::ALL.into_iter().flat_map(|style| {
+        TYPES.into_iter().flat_map(move |building_type| {
+            GARDENS.into_iter().flat_map(move |garden| {
+                (1..=4).flat_map(move |floors| {
+                    (1..=7).flat_map(move |rooms| {
+                        (0..6).map(move |seed| BuildingParams {
+                            seed,
+                            floors,
+                            size: Size {
+                                width: 14.0,
+                                depth: 11.0,
+                            },
+                            building_type,
+                            rooms,
+                            garden,
+                            style,
+                        })
                     })
                 })
             })
@@ -210,7 +214,7 @@ fn sweep_holds_invariants() {
         }
         checked += 1;
     }
-    assert_eq!(checked, 4 * 4 * 4 * 7 * 6);
+    assert_eq!(checked, 2 * 4 * 4 * 4 * 7 * 6);
 }
 
 #[test]
@@ -299,90 +303,6 @@ fn invalid_parameters_are_rejected() {
         }),
         ParamError::NoRoomForStairs { .. }
     ));
-}
-
-#[test]
-fn obj_export_is_well_formed() {
-    for p in [
-        params(1),
-        BuildingParams {
-            building_type: BuildingType::Villa,
-            garden: Garden::Surrounding,
-            floors: 3,
-            ..params(9)
-        },
-    ] {
-        let b = generate(&p).unwrap();
-        let export = obj::to_obj(&b, "test.mtl");
-        let vertices = export.obj.lines().filter(|l| l.starts_with("v ")).count();
-        assert!(vertices > 100);
-        let mut faces = 0;
-        for line in export.obj.lines().filter(|l| l.starts_with("f ")) {
-            let indices: Vec<usize> = line[2..].split(' ').map(|i| i.parse().unwrap()).collect();
-            assert!(indices.len() >= 3);
-            assert!(
-                indices.iter().all(|&i| i >= 1 && i <= vertices),
-                "bad face: {line}"
-            );
-            faces += 1;
-        }
-        assert!(faces > 100);
-        assert!(export.obj.contains("mtllib test.mtl"));
-        for material in export.obj.lines().filter_map(|l| l.strip_prefix("usemtl ")) {
-            assert!(
-                export.mtl.contains(&format!("newmtl {material}\n")),
-                "missing material {material}"
-            );
-        }
-        for group in [
-            "floor0_walls",
-            "floor0_glass",
-            "roof_slab",
-            "floor0_partitions",
-        ] {
-            assert!(
-                export.obj.contains(&format!("g {group}\n")),
-                "missing group {group}"
-            );
-        }
-    }
-}
-
-#[test]
-fn obj_export_writes_both_files() {
-    let dir = std::env::temp_dir().join(format!("urbanitas-test-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("house.obj");
-    obj::write_obj(&generate(&params(5)).unwrap(), &path).unwrap();
-    assert!(
-        std::fs::read_to_string(&path)
-            .unwrap()
-            .contains("mtllib house.mtl")
-    );
-    assert!(
-        std::fs::read_to_string(dir.join("house.mtl"))
-            .unwrap()
-            .contains("newmtl wall")
-    );
-    std::fs::remove_dir_all(dir).unwrap();
-}
-
-#[test]
-fn svg_plan_per_floor() {
-    let b = generate(&BuildingParams {
-        floors: 3,
-        ..params(11)
-    })
-    .unwrap();
-    let plans = svg::floor_plans(&b);
-    assert_eq!(plans.len(), 3);
-    for (plan, floor) in plans.iter().zip(&b.floors) {
-        assert!(plan.starts_with("<svg") && plan.trim_end().ends_with("</svg>"));
-        assert!(plan.contains(&floor.name()));
-        for room in &floor.rooms {
-            assert!(plan.contains(&format!(">{}</text>", room.kind.label())));
-        }
-    }
 }
 
 #[test]

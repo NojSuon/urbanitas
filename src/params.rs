@@ -73,12 +73,21 @@ impl Garden {
 pub enum ArchitectureStyle {
     /// Whitewashed thick walls, arched openings, shutters, terracotta or flat terrace roofs.
     Mediterranean,
+    /// Renaissance Tuscan: ochre plaster over a rusticated stone base, stone-framed
+    /// arched windows, a deep cornice and wide tiled eaves, loggias and fountains.
+    Florentine,
 }
 
 impl ArchitectureStyle {
+    pub const ALL: [ArchitectureStyle; 2] = [
+        ArchitectureStyle::Mediterranean,
+        ArchitectureStyle::Florentine,
+    ];
+
     pub fn label(self) -> &'static str {
         match self {
             ArchitectureStyle::Mediterranean => "Mediterranean",
+            ArchitectureStyle::Florentine => "Florentine",
         }
     }
 }
