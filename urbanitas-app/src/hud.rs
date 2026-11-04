@@ -1,11 +1,10 @@
-//! The HUD: a slim icon rail whose panels slide in over the view (Landscape, Town, Build,
-//! Designs, Colours, Settings), a bubble toolbar of terrain tools, a floating card that
-//! follows the selection, toasts, a minimap and a status bar.
-
-use std::f32::consts::TAU;
+//! The HUD: one toolbar at the bottom with the four steps (Land, Town, Build, Designs). Land
+//! and Town open their options just above it; Build and Designs open a panel with every
+//! piece in view. A small card follows the selection, and short notices appear at the top.
+//! Everything else lives in the menu.
 
 use bevy::prelude::*;
-use bevy_egui::egui::{self, Align, Color32, Layout as UiLayout, Margin, RichText, pos2, vec2};
+use bevy_egui::egui::{self, Align2, Color32, Margin, RichText, pos2, vec2};
 use bevy_egui::{EguiContexts, EguiPrimaryContextPass};
 use bevy_panorbit_camera::PanOrbitCamera;
 use urbanitas::design::{Design, update_copies};
@@ -20,14 +19,14 @@ use urbanitas::{
 };
 
 use crate::files::{self, Export};
-use crate::project::{Mode, Project, Quality, Source};
+use crate::project::{Project, Quality, Source};
 use crate::scene::{MainCamera, SceneStats};
 use crate::theme::{
     self, GOLD, GOLD_SOFT, PARCHMENT, PARCHMENT_DARK, PARCHMENT_LIGHT, SEPIA, SEPIA_SOFT,
     TERRACOTTA,
 };
 use crate::thumbs::Thumbs;
-use crate::tools::{self, Category, Item, Placement, Pointer, Sculpt, Tool};
+use crate::tools::{self, Category, Item, Pointer, Sculpt, Tool};
 
 pub struct HudPlugin;
 
@@ -39,45 +38,30 @@ impl Plugin for HudPlugin {
     }
 }
 
-/// The panels on the rail.
+/// The steps on the toolbar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Panel {
-    Landscape,
+    Land,
     Town,
     Build,
     Designs,
-    Colours,
-    Settings,
 }
 
 impl Panel {
-    const ALL: [Panel; 6] = [
-        Panel::Landscape,
-        Panel::Town,
-        Panel::Build,
-        Panel::Designs,
-        Panel::Colours,
-        Panel::Settings,
-    ];
+    const ALL: [Panel; 4] = [Panel::Land, Panel::Town, Panel::Build, Panel::Designs];
 
     fn label(self) -> &'static str {
         match self {
-            Panel::Landscape => "Landscape",
+            Panel::Land => "Land",
             Panel::Town => "Town",
             Panel::Build => "Build",
             Panel::Designs => "Designs",
-            Panel::Colours => "Colours",
-            Panel::Settings => "Settings",
         }
     }
 
-    /// The mode the panel works in, if it needs one.
-    fn mode(self) -> Option<Mode> {
-        match self {
-            Panel::Landscape | Panel::Town => Some(Mode::Generate),
-            Panel::Build | Panel::Designs => Some(Mode::Build),
-            Panel::Colours | Panel::Settings => None,
-        }
+    /// Whether the step opens the parts panel rather than options above the toolbar.
+    fn has_parts(self) -> bool {
+        matches!(self, Panel::Build | Panel::Designs)
     }
 }
 
@@ -87,18 +71,19 @@ pub struct HudState {
     open_dialog: bool,
     projects: Vec<std::path::PathBuf>,
     fps: f32,
-    /// The open panel; `shown` keeps drawing the last one while it slides away.
+    /// The open step, if any.
     pub panel: Option<Panel>,
-    shown: Panel,
-    toasts: Vec<(String, f64)>,
+    /// The step's less-used settings are showing.
+    more: bool,
+    /// When the panel last changed, to fade it in.
+    panel_at: f64,
+    /// The house card's colours are showing.
+    card_colours: bool,
+    toast: Option<(String, f64)>,
     last_status: String,
-    design_name: String,
-    /// Which house the design name was filled in for.
-    design_name_for: Option<u32>,
-    water_open: bool,
+    show_minimap: bool,
     minimap: Option<(egui::TextureHandle, u64)>,
     minimap_at: f64,
-    show_minimap: bool,
 }
 
 impl Default for HudState {
@@ -108,23 +93,24 @@ impl Default for HudState {
             open_dialog: false,
             projects: Vec::new(),
             fps: 60.0,
-            panel: Some(Panel::Landscape),
-            shown: Panel::Landscape,
-            toasts: Vec::new(),
+            panel: Some(Panel::Land),
+            more: false,
+            panel_at: -1.0,
+            card_colours: false,
+            toast: None,
             last_status: String::new(),
-            design_name: String::new(),
-            design_name_for: None,
-            water_open: false,
+            show_minimap: false,
             minimap: None,
             minimap_at: -1.0,
-            show_minimap: true,
         }
     }
 }
 
 const DEBOUNCE: f64 = 0.2;
-const PANEL_WIDTH: f32 = 318.0;
-const TOAST_SECONDS: f64 = 4.0;
+const PARTS_WIDTH: f32 = 312.0;
+const CARD_WIDTH: f32 = 270.0;
+const MARGIN: f32 = 12.0;
+const TOAST_SECONDS: f64 = 3.5;
 
 fn regenerate_when_due(mut project: ResMut<Project>, time: Res<Time>) {
     if project
@@ -136,14 +122,7 @@ fn regenerate_when_due(mut project: ResMut<Project>, time: Res<Time>) {
     }
 }
 
-fn bar_frame() -> egui::Frame {
-    egui::Frame::NONE
-        .fill(PARCHMENT)
-        .inner_margin(Margin::same(12))
-        .stroke(egui::Stroke::new(1.0, GOLD_SOFT))
-}
-
-/// A floating card: rounded, softly shadowed parchment.
+/// A floating box: rounded, softly shadowed parchment.
 fn card() -> egui::Frame {
     egui::Frame::NONE
         .fill(PARCHMENT)
@@ -156,11 +135,6 @@ fn card() -> egui::Frame {
             spread: 0,
             color: Color32::from_black_alpha(60),
         })
-}
-
-/// Eases a 0–1 animation value out (fast start, gentle stop).
-fn ease(t: f32) -> f32 {
-    1.0 - (1.0 - t).powi(3)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -188,130 +162,63 @@ fn hud(
     let now = time.elapsed_secs_f64();
     if project.status != state.last_status {
         state.last_status = project.status.clone();
-        if !project.status.is_empty() {
-            state.toasts.push((project.status.clone(), now));
-        }
-    }
-    state.toasts.retain(|(_, at)| now - at < TOAST_SECONDS);
-    if state.toasts.len() > 4 {
-        state.toasts.remove(0);
+        state.toast = (!project.status.is_empty()).then(|| (project.status.clone(), now));
     }
 
-    let mut root = egui::Ui::new(
-        ctx.clone(),
-        "hud".into(),
-        egui::UiBuilder::new()
-            .layer_id(egui::LayerId::background())
-            .max_rect(ctx.viewport_rect()),
-    );
-
-    let top = egui::Panel::top("top_bar")
-        .frame(bar_frame().inner_margin(Margin::symmetric(14, 8)))
-        .show(&mut root, |ui| {
-            top_bar(ui, &mut project, &mut state, &mut tool)
-        })
-        .response
-        .rect;
-    let bottom = egui::Panel::bottom("status_bar")
-        .frame(bar_frame().inner_margin(Margin::symmetric(14, 5)))
-        .show(&mut root, |ui| {
-            status_bar(ui, &project, &tool, &stats, state.fps)
-        })
-        .response
-        .rect;
-    let rail = egui::Panel::left("rail")
-        .exact_size(58.0)
-        .frame(bar_frame().inner_margin(Margin::symmetric(7, 10)))
-        .show(&mut root, |ui| {
-            rail_buttons(ui, &mut project, &mut tool, &mut state)
-        })
-        .response
-        .rect;
-
-    // The panel slides out from under the rail.
-    let open =
-        ctx.animate_bool_with_time(egui::Id::new("panel_slide"), state.panel.is_some(), 0.22);
-    if let Some(panel) = state.panel {
-        state.shown = panel;
-    }
-    let slide = ease(open);
-    let panel_left = rail.right() + 10.0 - (1.0 - slide) * (PANEL_WIDTH + 30.0);
-    if open > 0.001 {
-        let height = (bottom.top() - top.bottom() - 20.0).max(120.0);
-        egui::Area::new(egui::Id::new("panel"))
-            .fixed_pos(pos2(panel_left, top.bottom() + 10.0))
-            .order(egui::Order::Middle)
-            .show(&ctx, |ui| {
-                ui.multiply_opacity(open);
-                card().show(ui, |ui| {
-                    ui.set_width(PANEL_WIDTH - 24.0);
-                    // A full-height sheet, so the scroll area has room inside it.
-                    ui.set_min_height(height - 24.0);
-                    egui::ScrollArea::vertical().max_height(height - 24.0).show(
-                        ui,
-                        |ui| match state.shown {
-                            Panel::Landscape => landscape_panel(ui, &mut project, &mut tool, now),
-                            Panel::Town => town_panel(ui, &mut project, now),
-                            Panel::Build => build_panel(ui, &mut project, &mut tool, &thumbs),
-                            Panel::Designs => {
-                                designs_panel(ui, &mut project, &mut tool, &mut state, &thumbs)
-                            }
-                            Panel::Colours => colours_panel(ui, &mut project),
-                            Panel::Settings => settings_panel(ui, &mut project, &mut state),
-                        },
-                    );
-                });
-            });
-    }
-
-    // Terrain tools float beside the panel, in build mode or with the landscape open.
-    if project.mode == Mode::Build || state.panel == Some(Panel::Landscape) {
-        let x = rail.right() + 12.0 + slide * (PANEL_WIDTH + 12.0);
-        bubbles(
+    top_buttons(&ctx, &mut project, &mut tool, &mut state, &stats);
+    let bar_top = toolbar(&ctx, &mut project, &mut tool, &mut state, now);
+    match state.panel {
+        Some(panel) if panel.has_parts() => parts_panel(
             &ctx,
-            x,
-            (top.bottom() + bottom.top()) / 2.0,
+            panel,
             &mut project,
             &mut tool,
             &mut state,
-        );
-    }
-
-    if let Some(group) = project.open_group {
-        open_house_banner(&ctx, top.bottom() + 12.0, &mut project, group);
-    }
-    if project.placing_piazza {
-        hint_banner(
+            &thumbs,
+            now,
+        ),
+        Some(panel) => options_tray(
             &ctx,
-            top.bottom() + 12.0,
-            "Click the map to place the piazza · Esc cancels",
+            panel,
+            bar_top,
+            &mut project,
+            &mut tool,
+            &mut state,
+            now,
+        ),
+        None => {}
+    }
+    if let Ok((camera, transform)) = camera.single() {
+        let left = if state.panel.is_some_and(Panel::has_parts) {
+            PARTS_WIDTH + MARGIN * 2.0
+        } else {
+            MARGIN
+        };
+        floating_card(
+            &ctx,
+            &mut project,
+            &mut tool,
+            &mut state,
+            &thumbs,
+            camera,
+            transform,
+            left,
+            now,
         );
     }
-
-    if project.mode == Mode::Build {
-        if let Ok((camera, transform)) = camera.single() {
-            floating_card(
-                &ctx,
-                &mut project,
-                &mut state,
-                &thumbs,
-                camera,
-                transform,
-                panel_left + PANEL_WIDTH * slide,
-            );
-        }
+    let mut toast_y = MARGIN;
+    if let Some(group) = project.open_group {
+        open_house_banner(&ctx, &mut project, group);
+        toast_y += 52.0;
     }
-
-    let mut map_top = bottom.top() - 10.0;
+    toast(&ctx, &state, toast_y, now);
     if state.show_minimap {
         if let Ok(mut orbit) = orbit.single_mut() {
-            map_top = minimap(&ctx, &mut state, &project, &mut orbit, bottom.top(), now);
+            minimap(&ctx, &mut state, &project, &mut orbit, now);
         }
     }
-    toasts(&ctx, &state, map_top, now);
-
     if state.open_dialog {
-        open_dialog(&ctx, &mut project, &mut state);
+        open_dialog(&ctx, &mut project, &mut state, now);
     }
 
     pointer.over_ui = ctx.is_pointer_over_egui() || ctx.egui_wants_pointer_input();
@@ -319,7 +226,32 @@ fn hud(
     Ok(())
 }
 
-fn open_dialog(ctx: &egui::Context, project: &mut Project, state: &mut HudState) {
+/// Opens a step (or closes them all): any tool in hand is put away.
+fn open_step(
+    project: &mut Project,
+    tool: &mut Tool,
+    state: &mut HudState,
+    panel: Option<Panel>,
+    now: f64,
+) {
+    tool.pick(None);
+    project.placing_piazza = false;
+    state.panel = panel;
+    state.more = false;
+    state.panel_at = now;
+    // Leaving the parts behind: back to the whole town, walls up.
+    let building = panel.is_some_and(Panel::has_parts);
+    if !building
+        && project.open_group.is_none()
+        && (project.level != 0 || project.walls != WallMode::Up)
+    {
+        project.level = 0;
+        project.walls = WallMode::Up;
+        project.mark_all();
+    }
+}
+
+fn open_dialog(ctx: &egui::Context, project: &mut Project, state: &mut HudState, now: f64) {
     let mut open = true;
     let mut chosen = None;
     egui::Window::new(
@@ -328,7 +260,7 @@ fn open_dialog(ctx: &egui::Context, project: &mut Project, state: &mut HudState)
     .open(&mut open)
     .collapsible(false)
     .resizable(false)
-    .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+    .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
     .show(ctx, |ui| {
         if state.projects.is_empty() {
             ui.label(format!(
@@ -350,8 +282,8 @@ fn open_dialog(ctx: &egui::Context, project: &mut Project, state: &mut HudState)
         match files::open(&path) {
             Ok(layout) => {
                 project.replace(layout);
-                project.mode = Mode::Build;
                 state.panel = Some(Panel::Build);
+                state.panel_at = now;
                 project.status = format!("Opened {}", path.display());
             }
             Err(err) => project.status = format!("Could not open {}: {err}", path.display()),
@@ -361,342 +293,161 @@ fn open_dialog(ctx: &egui::Context, project: &mut Project, state: &mut HudState)
     state.open_dialog = open;
 }
 
-fn top_bar(ui: &mut egui::Ui, project: &mut Project, state: &mut HudState, tool: &mut Tool) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("URBANITAS")
-                .font(egui::FontId::new(24.0, theme::heading_family()))
-                .color(TERRACOTTA),
-        );
-        ui.label(
-            RichText::new("architettura procedurale")
-                .italics()
-                .color(SEPIA_SOFT),
-        );
-        ui.add_space(18.0);
-        if ui
-            .button("New plot")
-            .on_hover_text("Start from an empty lawn in build mode")
-            .clicked()
-        {
-            project.replace(files::empty_plot(
-                project.site.building.style,
-                project.site.building.seed,
-            ));
-            project.mode = Mode::Build;
-            state.panel = Some(Panel::Build);
-            tool.pick(None);
-            project.status = "Empty plot: place a building, or start with a facade wall".into();
-        }
-        if ui.button("Save").clicked() {
-            project.status = match files::save(&project.layout) {
-                Ok(path) => format!("Saved {}", path.display()),
-                Err(err) => format!("Could not save: {err}"),
-            };
-        }
-        if ui.button("Open…").clicked() {
-            state.projects = files::list_projects();
-            state.open_dialog = true;
-        }
-        ui.menu_button("Export", |ui| {
-            for (format, label) in [
-                (Export::Obj, "3D model (OBJ + textures)"),
-                (Export::Svg, "Floor plans (SVG)"),
-                (Export::Json, "Project (JSON)"),
-            ] {
-                if ui.button(label).clicked() {
-                    project.status = match files::export(&project.layout, format, 512) {
-                        Ok(dir) => format!("Exported to {}", dir.display()),
-                        Err(err) => format!("Export failed: {err}"),
-                    };
-                    ui.close();
+/// Menu, Undo and Redo, in the top corner.
+fn top_buttons(
+    ctx: &egui::Context,
+    project: &mut Project,
+    tool: &mut Tool,
+    state: &mut HudState,
+    stats: &SceneStats,
+) {
+    egui::Area::new(egui::Id::new("top_buttons"))
+        .fixed_pos(pos2(MARGIN, MARGIN))
+        .order(egui::Order::Middle)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.menu_button("Menu", |ui| menu(ui, project, tool, state, stats));
+                if ui
+                    .add_enabled(project.can_undo(), egui::Button::new("Undo"))
+                    .clicked()
+                {
+                    project.undo();
                 }
-            }
-        });
-        ui.separator();
-        if ui
-            .add_enabled(project.can_undo(), egui::Button::new("Undo"))
-            .clicked()
-        {
-            project.undo();
-        }
-        if ui
-            .add_enabled(project.can_redo(), egui::Button::new("Redo"))
-            .clicked()
-        {
-            project.redo();
-        }
-        ui.with_layout(UiLayout::right_to_left(Align::Center), |ui| {
-            let mode = match project.mode {
-                Mode::Generate => "Generating",
-                Mode::Build => "Building",
-            };
-            ui.label(RichText::new(mode).italics().color(SEPIA_SOFT));
-        });
-    });
-}
-
-fn status_bar(ui: &mut egui::Ui, project: &Project, tool: &Tool, stats: &SceneStats, fps: f32) {
-    ui.horizontal(|ui| {
-        ui.label(&project.status);
-        ui.with_layout(UiLayout::right_to_left(Align::Center), |ui| {
-            ui.label(
-                RichText::new(format!(
-                    "{fps:.0} fps · {} k triangles · rebuilt in {:.0} ms",
-                    stats.triangles() / 1000,
-                    stats.build_ms
-                ))
-                .small()
-                .color(SEPIA_SOFT),
-            );
-            ui.separator();
-            let hint = match (project.mode, tool.item) {
-                (_, _) if project.placing_piazza => "Click the map to place the piazza".to_string(),
-                (Mode::Generate, _) => "Right-drag orbit · middle-drag pan · scroll zoom".to_string(),
-                (Mode::Build, Some(item)) => {
-                    format!("{} · Alt: free placement · Q/E turn · Esc: done", item.hint())
+                if ui
+                    .add_enabled(project.can_redo(), egui::Button::new("Redo"))
+                    .clicked()
+                {
+                    project.redo();
                 }
-                (Mode::Build, None) => "Click: select · Shift+click: whole house · drag: move · R turn · Del delete · PgUp/PgDn level".into(),
-            };
-            ui.label(RichText::new(hint).small().color(SEPIA_SOFT));
+            });
         });
-    });
 }
 
-// ---------------------------------------------------------------------------------------
-// Icons, painted so they look the same whatever fonts are installed.
-
-#[derive(Clone, Copy)]
-enum Icon {
-    Panel(Panel),
-    Sculpt(Sculpt),
-    Water,
-}
-
-fn paint_icon(painter: &egui::Painter, rect: egui::Rect, icon: Icon, colour: Color32) {
-    let p = |x: f32, y: f32| rect.min + vec2(x * rect.width(), y * rect.height());
-    let stroke = egui::Stroke::new(1.8, colour);
-    let line = |points: Vec<egui::Pos2>| {
-        painter.add(egui::Shape::line(points, stroke));
-    };
-    let wave = |y: f32, amp: f32| -> Vec<egui::Pos2> {
-        (0..=16)
-            .map(|k| {
-                let t = k as f32 / 16.0;
-                p(0.15 + 0.7 * t, y + amp * (t * TAU * 1.5).sin())
-            })
-            .collect()
-    };
-    match icon {
-        Icon::Panel(Panel::Landscape) => {
-            line(vec![
-                p(0.1, 0.8),
-                p(0.38, 0.32),
-                p(0.55, 0.58),
-                p(0.68, 0.42),
-                p(0.9, 0.8),
-            ]);
-            line(vec![p(0.1, 0.8), p(0.9, 0.8)]);
-            line(vec![p(0.31, 0.44), p(0.38, 0.32), p(0.45, 0.44)]);
-        }
-        Icon::Panel(Panel::Town) => {
-            for (x, w, h) in [(0.12, 0.22, 0.3), (0.62, 0.26, 0.24)] {
-                let r = egui::Rect::from_min_max(p(x, 0.8 - h), p(x + w, 0.8));
-                painter.rect_stroke(r, 1.0, stroke, egui::StrokeKind::Middle);
-            }
-            let tower = egui::Rect::from_min_max(p(0.4, 0.28), p(0.56, 0.8));
-            painter.rect_stroke(tower, 1.0, stroke, egui::StrokeKind::Middle);
-            line(vec![p(0.37, 0.3), p(0.48, 0.14), p(0.59, 0.3)]);
-            line(vec![p(0.06, 0.8), p(0.94, 0.8)]);
-        }
-        Icon::Panel(Panel::Build) => {
-            for row in 0..3 {
-                let y = 0.3 + row as f32 * 0.17;
-                line(vec![p(0.14, y), p(0.86, y)]);
-                let shift = if row % 2 == 0 { 0.0 } else { 0.12 };
-                for k in 0..3 {
-                    let x = 0.26 + shift + k as f32 * 0.24;
-                    line(vec![p(x, y), p(x, y + 0.17)]);
-                }
-            }
-            line(vec![p(0.14, 0.81), p(0.86, 0.81)]);
-        }
-        Icon::Panel(Panel::Designs) => {
-            line(vec![
-                p(0.24, 0.14),
-                p(0.62, 0.14),
-                p(0.78, 0.3),
-                p(0.78, 0.86),
-                p(0.24, 0.86),
-                p(0.24, 0.14),
-            ]);
-            line(vec![p(0.62, 0.14), p(0.62, 0.3), p(0.78, 0.3)]);
-            line(vec![p(0.34, 0.66), p(0.51, 0.5), p(0.68, 0.66)]);
-            line(vec![
-                p(0.38, 0.62),
-                p(0.38, 0.76),
-                p(0.64, 0.76),
-                p(0.64, 0.62),
-            ]);
-        }
-        Icon::Panel(Panel::Colours) => {
-            painter.circle_stroke(p(0.5, 0.5), rect.width() * 0.34, stroke);
-            for (x, y) in [(0.36, 0.36), (0.58, 0.32), (0.68, 0.52), (0.38, 0.6)] {
-                painter.circle_filled(p(x, y), rect.width() * 0.055, colour);
-            }
-        }
-        Icon::Panel(Panel::Settings) => {
-            let c = p(0.5, 0.5);
-            painter.circle_stroke(c, rect.width() * 0.17, stroke);
-            for k in 0..8 {
-                let a = k as f32 * TAU / 8.0;
-                let d = vec2(a.cos(), a.sin()) * rect.width();
-                painter.line_segment([c + d * 0.25, c + d * 0.36], egui::Stroke::new(3.0, colour));
-            }
-        }
-        Icon::Sculpt(Sculpt::Raise) => {
-            line(vec![
-                p(0.12, 0.8),
-                p(0.32, 0.8),
-                p(0.5, 0.52),
-                p(0.68, 0.8),
-                p(0.88, 0.8),
-            ]);
-            line(vec![p(0.5, 0.42), p(0.5, 0.14)]);
-            line(vec![p(0.38, 0.26), p(0.5, 0.14), p(0.62, 0.26)]);
-        }
-        Icon::Sculpt(Sculpt::Lower) => {
-            line(vec![
-                p(0.12, 0.6),
-                p(0.32, 0.6),
-                p(0.5, 0.84),
-                p(0.68, 0.6),
-                p(0.88, 0.6),
-            ]);
-            line(vec![p(0.5, 0.14), p(0.5, 0.46)]);
-            line(vec![p(0.38, 0.34), p(0.5, 0.46), p(0.62, 0.34)]);
-        }
-        Icon::Sculpt(Sculpt::Flatten) => {
-            line(vec![p(0.14, 0.62), p(0.86, 0.62)]);
-            line(vec![p(0.14, 0.78), p(0.86, 0.78)]);
-            line(vec![
-                p(0.3, 0.22),
-                p(0.7, 0.22),
-                p(0.7, 0.42),
-                p(0.3, 0.42),
-                p(0.3, 0.22),
-            ]);
-        }
-        Icon::Sculpt(Sculpt::Smooth) => {
-            line(wave(0.42, 0.12));
-            line(wave(0.66, 0.05));
-        }
-        Icon::Sculpt(Sculpt::Sand) => {
-            for (x, y) in [
-                (0.3, 0.3),
-                (0.52, 0.26),
-                (0.7, 0.36),
-                (0.4, 0.48),
-                (0.62, 0.54),
-                (0.28, 0.66),
-                (0.5, 0.72),
-                (0.72, 0.72),
-            ] {
-                painter.circle_filled(p(x, y), rect.width() * 0.045, colour);
-            }
-        }
-        Icon::Water => {
-            line(wave(0.4, 0.08));
-            line(wave(0.6, 0.08));
-            line(wave(0.8, 0.08));
-        }
-    }
-}
-
-/// A square icon button with an eased hover glow.
-fn icon_button(
+fn menu(
     ui: &mut egui::Ui,
-    icon: Icon,
-    size: f32,
-    active: bool,
-    round: bool,
-    tip: &str,
-) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(size, size), egui::Sense::click());
-    let hover =
-        ui.ctx()
-            .animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.12);
-    let radius = if round { size / 2.0 } else { 8.0 };
-    let fill = if active {
-        TERRACOTTA
-    } else {
-        lerp_colour(PARCHMENT_LIGHT, Color32::from_rgb(240, 222, 186), hover)
-    };
-    let painter = ui.painter_at(rect.expand(6.0));
-    if hover > 0.0 || active {
-        painter.rect_filled(
-            rect.expand(2.0 + 2.0 * hover),
-            radius + 2.0,
-            Color32::from_rgba_unmultiplied(
-                214,
-                168,
-                72,
-                (70.0 * hover.max(active as u8 as f32)) as u8,
-            ),
-        );
+    project: &mut Project,
+    tool: &mut Tool,
+    state: &mut HudState,
+    stats: &SceneStats,
+) {
+    if ui.button("New plot").clicked() {
+        project.replace(files::empty_plot(
+            project.site.building.style,
+            project.site.building.seed,
+        ));
+        state.panel = Some(Panel::Build);
+        tool.pick(None);
+        project.status = "Empty plot: place a house, or start with a facade wall".into();
+        ui.close();
     }
-    painter.rect_filled(rect, radius, fill);
-    painter.rect_stroke(
-        rect,
-        radius,
-        egui::Stroke::new(1.0, GOLD_SOFT),
-        egui::StrokeKind::Inside,
-    );
-    let colour = if active { PARCHMENT_LIGHT } else { SEPIA };
-    paint_icon(&painter, rect.shrink(size * 0.18), icon, colour);
-    response.on_hover_text(tip)
-}
-
-fn lerp_colour(a: Color32, b: Color32, t: f32) -> Color32 {
-    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
-    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
-}
-
-fn rail_buttons(ui: &mut egui::Ui, project: &mut Project, tool: &mut Tool, state: &mut HudState) {
-    ui.vertical_centered(|ui| {
-        ui.spacing_mut().item_spacing = vec2(0.0, 8.0);
-        for panel in Panel::ALL {
-            let active = state.panel == Some(panel);
-            if icon_button(ui, Icon::Panel(panel), 42.0, active, false, panel.label()).clicked() {
-                if active {
-                    state.panel = None;
-                } else {
-                    open_panel(project, tool, state, panel);
-                }
+    if ui.button("Save").clicked() {
+        project.status = match files::save(&project.layout) {
+            Ok(path) => format!("Saved {}", path.display()),
+            Err(err) => format!("Could not save: {err}"),
+        };
+        ui.close();
+    }
+    if ui.button("Open…").clicked() {
+        state.projects = files::list_projects();
+        state.open_dialog = true;
+        ui.close();
+    }
+    ui.menu_button("Export", |ui| {
+        for (format, label) in [
+            (Export::Obj, "3D model (OBJ + textures)"),
+            (Export::Svg, "Floor plans (SVG)"),
+            (Export::Json, "Project (JSON)"),
+        ] {
+            if ui.button(label).clicked() {
+                project.status = match files::export(&project.layout, format, 512) {
+                    Ok(dir) => format!("Exported to {}", dir.display()),
+                    Err(err) => format!("Export failed: {err}"),
+                };
+                ui.close();
             }
         }
     });
+    ui.separator();
+    ui.checkbox(&mut state.show_minimap, "Minimap");
+    ui.horizontal(|ui| {
+        ui.label("Quality");
+        for (quality, label) in [(Quality::Low, "Low"), (Quality::High, "High")] {
+            if ui
+                .selectable_label(project.quality == quality, label)
+                .clicked()
+                && project.quality != quality
+            {
+                project.quality = quality;
+                project.mark_all();
+            }
+        }
+    });
+    ui.menu_button("Keys", |ui| {
+        for line in [
+            "Right-drag orbit · middle-drag pan · scroll zoom",
+            "Click a house · Shift+click a single part",
+            "R turn · Q/E fine turn · Delete remove",
+            "PgUp/PgDn change floor · Alt place freely",
+            "Ctrl+Z undo · Ctrl+Y redo · Esc done",
+        ] {
+            note(ui, line);
+        }
+    });
+    ui.separator();
+    note(
+        ui,
+        &format!(
+            "{:.0} fps · {} k triangles · rebuilt in {:.0} ms",
+            state.fps,
+            stats.triangles() / 1000,
+            stats.build_ms
+        ),
+    );
 }
 
-/// Opens a panel, switching to the mode it works in.
-fn open_panel(project: &mut Project, tool: &mut Tool, state: &mut HudState, panel: Panel) {
-    state.panel = Some(panel);
-    if let Some(mode) = panel.mode() {
-        if project.mode != mode {
-            project.mode = mode;
-            tool.pick(None);
-            project.selected = None;
-            project.selected_group = None;
-            project.mark_all();
-        }
-    }
-    if panel != Panel::Town {
-        project.placing_piazza = false;
-    }
+/// The four steps, at the bottom. Returns the toolbar's top edge.
+fn toolbar(
+    ctx: &egui::Context,
+    project: &mut Project,
+    tool: &mut Tool,
+    state: &mut HudState,
+    now: f64,
+) -> f32 {
+    egui::Area::new(egui::Id::new("toolbar"))
+        .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -14.0))
+        .order(egui::Order::Middle)
+        .show(ctx, |ui| {
+            card().inner_margin(Margin::same(5)).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing = vec2(4.0, 0.0);
+                    for panel in Panel::ALL {
+                        let active = state.panel == Some(panel);
+                        let (fill, ink) = if active {
+                            (TERRACOTTA, PARCHMENT_LIGHT)
+                        } else {
+                            (Color32::TRANSPARENT, SEPIA)
+                        };
+                        let button =
+                            egui::Button::new(RichText::new(panel.label()).size(16.0).color(ink))
+                                .fill(fill)
+                                .stroke(egui::Stroke::NONE)
+                                .corner_radius(7)
+                                .min_size(vec2(96.0, 38.0));
+                        if ui.add(button).clicked() {
+                            let next = if active { None } else { Some(panel) };
+                            open_step(project, tool, state, next, now);
+                        }
+                    }
+                });
+            });
+        })
+        .response
+        .rect
+        .top()
 }
 
 // ---------------------------------------------------------------------------------------
-// Panels.
+// Small building blocks.
 
 fn capitalise(text: &str) -> String {
     let mut chars = text.chars();
@@ -710,12 +461,35 @@ fn note(ui: &mut egui::Ui, text: &str) {
     ui.add(egui::Label::new(RichText::new(text).small().color(SEPIA_SOFT)).wrap());
 }
 
-fn big_button(ui: &mut egui::Ui, text: &str, enabled: bool) -> bool {
-    let button = egui::Button::new(RichText::new(text).size(15.0).color(PARCHMENT_LIGHT))
-        .fill(TERRACOTTA)
-        .corner_radius(6);
-    ui.add_enabled(enabled, button.min_size(vec2(ui.available_width(), 32.0)))
+fn caption(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).small().color(SEPIA_SOFT));
+}
+
+/// A button that stays lit while its option is on.
+fn choice(ui: &mut egui::Ui, label: &str, on: bool) -> bool {
+    let (fill, ink) = if on {
+        (TERRACOTTA, PARCHMENT_LIGHT)
+    } else {
+        (PARCHMENT_LIGHT, SEPIA)
+    };
+    ui.add(egui::Button::new(RichText::new(label).color(ink)).fill(fill))
         .clicked()
+}
+
+fn primary(ui: &mut egui::Ui, label: &str) -> bool {
+    let button = egui::Button::new(RichText::new(label).size(15.0).color(PARCHMENT_LIGHT))
+        .fill(TERRACOTTA)
+        .corner_radius(6)
+        .min_size(vec2(0.0, 32.0));
+    ui.add(button).clicked()
+}
+
+fn more_link(ui: &mut egui::Ui, more: &mut bool) {
+    let label = if *more { "Less" } else { "More" };
+    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+    if ui.link(RichText::new(label).color(SEPIA_SOFT)).clicked() {
+        *more = !*more;
+    }
 }
 
 fn reroll(seed: &mut u64) {
@@ -725,119 +499,315 @@ fn reroll(seed: &mut u64) {
         % 1_000_000;
 }
 
-fn landscape_panel(ui: &mut egui::Ui, project: &mut Project, tool: &mut Tool, now: f64) {
-    theme::title(ui, "Landscape");
-    theme::ornament(ui);
+fn lerp_colour(a: Color32, b: Color32, t: f32) -> Color32 {
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t) as u8;
+    Color32::from_rgb(mix(a.r(), b.r()), mix(a.g(), b.g()), mix(a.b(), b.b()))
+}
+
+/// Fades a panel in just after it opens.
+fn fade_in(ui: &mut egui::Ui, panel_at: f64, now: f64) {
+    ui.multiply_opacity((((now - panel_at) / 0.14).clamp(0.0, 1.0)) as f32);
+}
+
+// ---------------------------------------------------------------------------------------
+// Land and Town: options just above the toolbar.
+
+fn options_tray(
+    ctx: &egui::Context,
+    panel: Panel,
+    bar_top: f32,
+    project: &mut Project,
+    tool: &mut Tool,
+    state: &mut HudState,
+    now: f64,
+) {
+    let view = ctx.viewport_rect();
+    egui::Area::new(egui::Id::new(("tray", panel.label())))
+        .pivot(Align2::CENTER_BOTTOM)
+        .fixed_pos(pos2(view.center().x, bar_top - 8.0))
+        .order(egui::Order::Middle)
+        .show(ctx, |ui| {
+            fade_in(ui, state.panel_at, now);
+            ui.set_max_width(view.width() - 2.0 * MARGIN);
+            card().show(ui, |ui| match panel {
+                Panel::Town => town_options(ui, project, state, now),
+                _ => land_options(ui, project, tool, state, now),
+            });
+        });
+}
+
+fn land_options(
+    ui: &mut egui::Ui,
+    project: &mut Project,
+    tool: &mut Tool,
+    state: &mut HudState,
+    now: f64,
+) {
     let before = project.landscape;
-    let land = &mut project.landscape;
-    egui::Grid::new("landscape")
-        .num_columns(2)
-        .spacing([10.0, 9.0])
-        .show(ui, |ui| {
-            ui.label("Terrain");
-            egui::ComboBox::from_id_salt("relief")
-                .selected_text(land.relief.label())
-                .show_ui(ui, |ui| {
-                    for relief in Relief::ALL {
-                        ui.selectable_value(&mut land.relief, relief, relief.label());
-                    }
-                });
-            ui.end_row();
-            ui.label("Water");
-            egui::ComboBox::from_id_salt("water")
-                .selected_text(land.water.label())
-                .show_ui(ui, |ui| {
-                    for water in WaterBody::ALL {
-                        ui.selectable_value(&mut land.water, water, water.label());
-                    }
-                });
-            ui.end_row();
-            ui.label("Map size");
-            ui.add(
-                egui::Slider::new(&mut land.size, 160.0..=640.0)
-                    .step_by(20.0)
-                    .suffix(" m"),
-            );
-            ui.end_row();
-            ui.label("Seed");
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(18.0, 8.0);
+        ui.vertical(|ui| {
+            caption(ui, "Terrain");
             ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut land.seed).speed(1.0));
-                if ui.button("Reroll").clicked() {
-                    reroll(&mut land.seed);
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for relief in Relief::ALL {
+                    if choice(ui, relief.label(), project.landscape.relief == relief) {
+                        project.landscape.relief = relief;
+                    }
                 }
             });
-            ui.end_row();
         });
-    let changed = project.landscape != before;
-    if project.source != Source::Landscape {
-        ui.add_space(6.0);
-        if big_button(ui, "Use this landscape", true) {
-            project.source = Source::Landscape;
-            project.regenerate();
-        }
-    } else if changed {
-        project.regenerate_at = Some(now + DEBOUNCE);
-    }
-    note(
-        ui,
-        "Terrain tools float to the right: paint hills, valleys and beaches. Then grow a town in the Town panel.",
-    );
-
-    ui.add_space(10.0);
-    theme::title(ui, "Or a preset site");
-    theme::ornament(ui);
-    ui.horizontal_wrapped(|ui| {
-        for (context, label) in [
-            (Context::Single, "One building"),
-            (Context::Urban, "Street of palazzi"),
-            (Context::Suburban, "Villas"),
-            (Context::Rural, "Farm"),
-        ] {
-            let active = project.source == Source::Site && project.site.context == context;
-            if ui.selectable_label(active, label).clicked() {
-                project.source = Source::Site;
-                project.site.context = context;
-                project.plaza = None;
-                tool.pick(None);
-                project.regenerate();
-            }
-        }
-    });
-    if project.source == Source::Site {
-        let before = project.site.clone();
-        let site = &mut project.site;
-        egui::Grid::new("site")
-            .num_columns(2)
-            .spacing([10.0, 9.0])
-            .show(ui, |ui| {
-                if site.context != Context::Single {
-                    ui.label("Buildings");
-                    let max = if site.context == Context::Urban {
-                        14
-                    } else {
-                        6
-                    };
-                    ui.add(egui::Slider::new(&mut site.buildings, 1..=max));
-                    ui.end_row();
+        ui.vertical(|ui| {
+            caption(ui, "Water");
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for (water, label) in [
+                    (WaterBody::None, "None"),
+                    (WaterBody::Beach, "Beach"),
+                    (WaterBody::Cliffs, "Cliffs"),
+                    (WaterBody::BeachAndCliffs, "Both"),
+                    (WaterBody::Lake, "Lake"),
+                    (WaterBody::River, "River"),
+                ] {
+                    if choice(ui, label, project.landscape.water == water) {
+                        project.landscape.water = water;
+                    }
                 }
-                ui.label("Hills");
+            });
+        });
+        ui.vertical(|ui| {
+            caption(ui, "Paint the ground");
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                for sculpt in Sculpt::ALL {
+                    let item = Item::Terrain(sculpt);
+                    if choice(ui, item.label(), tool.item == Some(item)) {
+                        if tool.item == Some(item) {
+                            tool.pick(None);
+                        } else {
+                            tool.pick(Some(item));
+                            project.selected = None;
+                            project.selected_group = None;
+                            project.status = format!(
+                                "{}: hold the left button and paint. Houses are left alone.",
+                                item.label()
+                            );
+                        }
+                    }
+                }
+            });
+        });
+        if matches!(tool.item, Some(Item::Terrain(_))) {
+            ui.vertical(|ui| {
+                caption(ui, "Brush size");
+                ui.add(egui::Slider::new(&mut tool.brush_radius, 1.0..=30.0).suffix(" m"));
+            });
+        }
+        ui.vertical(|ui| {
+            ui.add_space(16.0);
+            more_link(ui, &mut state.more);
+        });
+    });
+    if state.more {
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(18.0, 8.0);
+            ui.vertical(|ui| {
+                caption(ui, "Map size");
                 ui.add(
-                    egui::Slider::new(&mut site.relief, 0.0..=10.0)
-                        .step_by(0.5)
+                    egui::Slider::new(&mut project.landscape.size, 160.0..=640.0)
+                        .step_by(20.0)
                         .suffix(" m"),
                 );
-                ui.end_row();
             });
-        egui::CollapsingHeader::new("Building")
-            .default_open(site.context == Context::Single)
-            .show(ui, |ui| building_grid(ui, &mut site.building));
-        if project.site != before {
-            project.regenerate_at = Some(now + DEBOUNCE);
+            ui.vertical(|ui| {
+                caption(ui, "Shape of the land");
+                if ui.button("Try another").clicked() {
+                    reroll(&mut project.landscape.seed);
+                }
+            });
+            ui.vertical(|ui| {
+                caption(ui, "Brush strength");
+                ui.add(egui::Slider::new(&mut tool.brush_strength, 0.1..=2.0));
+            });
+            if project.layout.water.is_some() {
+                ui.vertical(|ui| {
+                    caption(ui, "Water level");
+                    ui.horizontal(|ui| {
+                        for (label, rise) in [("Lower", -0.5), ("Raise", 0.5)] {
+                            if ui.button(label).clicked() {
+                                project.edit(&[], Some("water"), |l| {
+                                    if let Some(w) = l.water.as_mut() {
+                                        w.shift(rise);
+                                    }
+                                });
+                                project.mark_terrain();
+                            }
+                        }
+                    });
+                });
+            }
+            ui.vertical(|ui| {
+                caption(ui, "Start from a preset instead");
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+                    for (context, label) in [
+                        (Context::Single, "One building"),
+                        (Context::Urban, "Street of palazzi"),
+                        (Context::Suburban, "Villas"),
+                        (Context::Rural, "Farm"),
+                    ] {
+                        let on = project.source == Source::Site && project.site.context == context;
+                        if choice(ui, label, on) {
+                            project.source = Source::Site;
+                            project.site.context = context;
+                            project.plaza = None;
+                            tool.pick(None);
+                            project.regenerate();
+                        }
+                    }
+                });
+            });
+        });
+        if project.source == Source::Site {
+            ui.add_space(8.0);
+            site_settings(ui, project, now);
         }
     }
-    if let Some(err) = &project.error {
-        ui.add_space(4.0);
-        ui.label(RichText::new(err).color(TERRACOTTA));
+    if project.landscape != before {
+        project.source = Source::Landscape;
+        project.regenerate_at = Some(now + DEBOUNCE);
+    }
+}
+
+fn site_settings(ui: &mut egui::Ui, project: &mut Project, now: f64) {
+    let before = project.site.clone();
+    let site = &mut project.site;
+    ui.horizontal(|ui| {
+        if site.context != Context::Single {
+            ui.label("Buildings");
+            let max = if site.context == Context::Urban {
+                14
+            } else {
+                6
+            };
+            ui.add(egui::Slider::new(&mut site.buildings, 1..=max));
+        }
+        ui.label("Hills");
+        ui.add(
+            egui::Slider::new(&mut site.relief, 0.0..=10.0)
+                .step_by(0.5)
+                .suffix(" m"),
+        );
+    });
+    egui::CollapsingHeader::new("Building")
+        .id_salt("site_building")
+        .show(ui, |ui| building_grid(ui, &mut site.building));
+    if project.site != before {
+        project.regenerate_at = Some(now + DEBOUNCE);
+    }
+}
+
+fn town_options(ui: &mut egui::Ui, project: &mut Project, state: &mut HudState, now: f64) {
+    let before = project.town;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(18.0, 8.0);
+        ui.vertical(|ui| {
+            caption(ui, "Houses");
+            ui.add(egui::Slider::new(&mut project.town.houses, 4..=80));
+        });
+        let label = match (project.placing_piazza, project.plaza) {
+            (true, _) => "Click the map…",
+            (false, None) => "Place the piazza",
+            (false, Some(_)) => "Move the piazza",
+        };
+        ui.vertical(|ui| {
+            ui.add_space(10.0);
+            if primary(ui, label) {
+                project.placing_piazza = !project.placing_piazza;
+                project.status = if project.placing_piazza {
+                    "Click where the piazza goes: the town grows around it".into()
+                } else {
+                    "Piazza placing cancelled".into()
+                };
+            }
+        });
+        ui.vertical(|ui| {
+            ui.add_space(16.0);
+            more_link(ui, &mut state.more);
+        });
+    });
+    if state.more {
+        ui.add_space(8.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(18.0, 8.0);
+            ui.vertical(|ui| {
+                caption(ui, "Style");
+                egui::ComboBox::from_id_salt("town_style")
+                    .selected_text(project.town.style.label())
+                    .show_ui(ui, |ui| {
+                        for style in ArchitectureStyle::ALL {
+                            ui.selectable_value(&mut project.town.style, style, style.label());
+                        }
+                    });
+            });
+            ui.vertical(|ui| {
+                caption(ui, "Density");
+                ui.add(egui::Slider::new(&mut project.town.density, 0.0..=1.0).show_value(false));
+            });
+            ui.vertical(|ui| {
+                caption(ui, "Houses from");
+                egui::ComboBox::from_id_salt("mix")
+                    .selected_text(project.town.mix.label())
+                    .show_ui(ui, |ui| {
+                        for mix in DesignMix::ALL {
+                            ui.selectable_value(&mut project.town.mix, mix, mix.label());
+                        }
+                    });
+            });
+            ui.vertical(|ui| {
+                caption(ui, "This town");
+                ui.horizontal(|ui| {
+                    let has_town = project.plaza.is_some();
+                    if ui
+                        .add_enabled(has_town, egui::Button::new("Regrow"))
+                        .on_hover_text("Same piazza, new streets and houses")
+                        .clicked()
+                    {
+                        reroll(&mut project.town.seed);
+                        project.regenerate();
+                    }
+                    if ui
+                        .add_enabled(has_town, egui::Button::new("Clear"))
+                        .clicked()
+                    {
+                        project.clear_town();
+                    }
+                    if ui
+                        .button("Suggest a spot")
+                        .on_hover_text("Grow the town on the gentlest dry ground near the middle")
+                        .clicked()
+                    {
+                        match urbanitas::suggest_piazza(&project.layout) {
+                            Some(p) => project.grow_town_at(p),
+                            None => project.status = "No dry ground for a town here".into(),
+                        }
+                    }
+                });
+            });
+        });
+        if project.town.mix != DesignMix::Generated && project.designs.is_empty() {
+            note(
+                ui,
+                "You have no saved designs yet: save a house from its card.",
+            );
+        }
+        egui::CollapsingHeader::new("Town colours")
+            .id_salt("town_colours")
+            .show(ui, |ui| palette_editor(ui, project, None));
+    }
+    if project.town != before && project.plaza.is_some() {
+        project.regenerate_at = Some(now + DEBOUNCE);
     }
 }
 
@@ -923,127 +893,6 @@ fn building_grid(ui: &mut egui::Ui, p: &mut BuildingParams) {
         });
 }
 
-fn town_panel(ui: &mut egui::Ui, project: &mut Project, now: f64) {
-    theme::title(ui, "Town");
-    theme::ornament(ui);
-    if project.source != Source::Landscape {
-        note(ui, "Towns grow on landscapes.");
-        if big_button(ui, "Use a landscape", true) {
-            project.source = Source::Landscape;
-            project.regenerate();
-        }
-        return;
-    }
-    let before = project.town;
-    let designs = project.designs.len();
-    let town = &mut project.town;
-    egui::Grid::new("town")
-        .num_columns(2)
-        .spacing([10.0, 9.0])
-        .show(ui, |ui| {
-            ui.label("Style");
-            egui::ComboBox::from_id_salt("town_style")
-                .selected_text(town.style.label())
-                .show_ui(ui, |ui| {
-                    for style in ArchitectureStyle::ALL {
-                        ui.selectable_value(&mut town.style, style, style.label());
-                    }
-                });
-            ui.end_row();
-            ui.label("Houses");
-            ui.add(egui::Slider::new(&mut town.houses, 4..=80));
-            ui.end_row();
-            ui.label("Density");
-            ui.add(egui::Slider::new(&mut town.density, 0.0..=1.0).show_value(false))
-                .on_hover_text("How tightly houses pack, and how often streets branch");
-            ui.end_row();
-            ui.label("Houses from");
-            egui::ComboBox::from_id_salt("mix")
-                .selected_text(town.mix.label())
-                .show_ui(ui, |ui| {
-                    for mix in DesignMix::ALL {
-                        ui.selectable_value(&mut town.mix, mix, mix.label());
-                    }
-                });
-            ui.end_row();
-            ui.label("Seed");
-            ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut town.seed).speed(1.0));
-                if ui.button("Reroll").clicked() {
-                    reroll(&mut town.seed);
-                }
-            });
-            ui.end_row();
-        });
-    if project.town.mix != DesignMix::Generated && designs == 0 {
-        note(
-            ui,
-            "You have no saved designs yet: save houses in the Designs panel.",
-        );
-    }
-    if project.town != before && project.plaza.is_some() {
-        project.regenerate_at = Some(now + DEBOUNCE);
-    }
-    ui.add_space(8.0);
-    let label = match (project.placing_piazza, project.plaza) {
-        (true, _) => "Click the map… (Esc cancels)",
-        (false, None) => "Place the piazza",
-        (false, Some(_)) => "Move the piazza",
-    };
-    if big_button(ui, label, true) {
-        project.placing_piazza = !project.placing_piazza;
-        project.status = if project.placing_piazza {
-            "Click where the piazza goes: the town grows around it".into()
-        } else {
-            "Piazza placing cancelled".into()
-        };
-    }
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        let has_town = project.plaza.is_some();
-        if ui
-            .add_enabled(has_town, egui::Button::new("Regrow"))
-            .on_hover_text("Same piazza, new streets and houses")
-            .clicked()
-        {
-            reroll(&mut project.town.seed);
-            project.regenerate();
-        }
-        if ui
-            .add_enabled(has_town, egui::Button::new("Clear town"))
-            .clicked()
-        {
-            project.clear_town();
-        }
-        if ui
-            .button("Suggest a spot")
-            .on_hover_text("Grow the town on the gentlest dry ground near the middle")
-            .clicked()
-        {
-            match urbanitas::suggest_piazza(&project.layout) {
-                Some(p) => project.grow_town_at(p),
-                None => project.status = "No dry ground for a town here".into(),
-            }
-        }
-    });
-    if project.plaza.is_some() {
-        let streets = project
-            .layout
-            .parts
-            .iter()
-            .filter(|p| matches!(&p.kind, PartKind::Area(a) if a.kind == AreaKind::Street))
-            .count();
-        ui.add_space(4.0);
-        note(
-            ui,
-            &format!(
-                "{} houses on {streets} streets. Draw more streets in Build › Streets: houses fill both sides.",
-                project.layout.palettes.len()
-            ),
-        );
-    }
-}
-
 fn swatch(ui: &mut egui::Ui, colour: Rgb, selected: bool, name: &str) -> bool {
     let fill = Color32::from_rgb(colour.0, colour.1, colour.2);
     let stroke = if selected {
@@ -1078,7 +927,7 @@ fn palette_editor(ui: &mut egui::Ui, project: &mut Project, group: Option<u32>) 
     ];
     for (label, options, field) in rows {
         ui.horizontal_wrapped(|ui| {
-            ui.add_sized([62.0, 20.0], egui::Label::new(label));
+            ui.add_sized([58.0, 20.0], egui::Label::new(label));
             for (name, colour) in options {
                 let current = *field(&mut palette);
                 if swatch(ui, *colour, current == *colour, name) {
@@ -1105,61 +954,37 @@ fn palette_editor(ui: &mut egui::Ui, project: &mut Project, group: Option<u32>) 
     }
 }
 
-fn colours_panel(ui: &mut egui::Ui, project: &mut Project) {
-    let group = project.selected_group.or(project.open_group);
-    match group {
-        Some(g) => theme::title(ui, &format!("Colours · {}", tools::house_name(project, g))),
-        None => theme::title(ui, "Colours"),
-    }
-    theme::ornament(ui);
-    if group.is_none() {
-        note(
-            ui,
-            "The town's own colours (paths, walls and parts that belong to no house). Shift+click a house to colour it.",
-        );
-    }
-    palette_editor(ui, project, group);
-}
+// ---------------------------------------------------------------------------------------
+// Build and Designs: a panel with every piece in view.
 
-fn settings_panel(ui: &mut egui::Ui, project: &mut Project, state: &mut HudState) {
-    theme::title(ui, "Settings");
-    theme::ornament(ui);
-    egui::Grid::new("settings")
-        .num_columns(2)
-        .spacing([10.0, 9.0])
-        .show(ui, |ui| {
-            ui.label("Quality");
-            let mut quality = project.quality;
-            egui::ComboBox::from_id_salt("quality")
-                .selected_text(match quality {
-                    Quality::Low => "Low (fast)",
-                    Quality::High => "High",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut quality, Quality::Low, "Low (fast)");
-                    ui.selectable_value(&mut quality, Quality::High, "High");
-                });
-            if quality != project.quality {
-                project.quality = quality;
-                project.mark_all();
-            }
-            ui.end_row();
-            ui.label("Minimap");
-            ui.checkbox(&mut state.show_minimap, "Show");
-            ui.end_row();
+fn parts_panel(
+    ctx: &egui::Context,
+    panel: Panel,
+    project: &mut Project,
+    tool: &mut Tool,
+    state: &mut HudState,
+    thumbs: &Thumbs,
+    now: f64,
+) {
+    let view = ctx.viewport_rect();
+    let top = MARGIN + 44.0;
+    let height = (view.height() - top - MARGIN).max(160.0);
+    egui::Area::new(egui::Id::new("parts_panel"))
+        .fixed_pos(pos2(MARGIN, top))
+        .order(egui::Order::Middle)
+        .show(ctx, |ui| {
+            fade_in(ui, state.panel_at, now);
+            card().show(ui, |ui| {
+                ui.set_width(PARTS_WIDTH - 24.0);
+                ui.set_min_height(height - 24.0);
+                egui::ScrollArea::vertical()
+                    .max_height(height - 24.0)
+                    .show(ui, |ui| match panel {
+                        Panel::Designs => designs_list(ui, project, tool, thumbs),
+                        _ => build_list(ui, project, tool, state, thumbs),
+                    });
+            });
         });
-    ui.add_space(8.0);
-    theme::title(ui, "Keys");
-    theme::ornament(ui);
-    for line in [
-        "Right-drag orbit · middle-drag pan · scroll zoom",
-        "Click select · Shift+click a whole house",
-        "R turn · Q/E fine turn · Delete remove",
-        "PgUp/PgDn change level · Alt place freely",
-        "Ctrl+Z undo · Ctrl+Y redo · Esc done",
-    ] {
-        note(ui, line);
-    }
 }
 
 fn picture_tile(
@@ -1173,21 +998,20 @@ fn picture_tile(
     let hover =
         ui.ctx()
             .animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.12);
-    let painter = ui.painter_at(rect.expand(3.0));
-    let lift = rect.translate(vec2(0.0, -2.0 * hover));
+    let painter = ui.painter_at(rect);
     let fill = if selected {
         Color32::from_rgb(236, 205, 160)
     } else {
         lerp_colour(PARCHMENT_DARK, Color32::from_rgb(240, 225, 196), hover)
     };
-    painter.rect_filled(lift, 6.0, fill);
+    painter.rect_filled(rect, 6.0, fill);
     let border = if selected {
         egui::Stroke::new(2.0, TERRACOTTA)
     } else {
         egui::Stroke::new(1.0, GOLD_SOFT)
     };
-    painter.rect_stroke(lift, 6.0, border, egui::StrokeKind::Inside);
-    let image = egui::Rect::from_min_size(lift.min + vec2(6.0, 5.0), vec2(76.0, 76.0));
+    painter.rect_stroke(rect, 6.0, border, egui::StrokeKind::Inside);
+    let image = egui::Rect::from_min_size(rect.min + vec2(6.0, 5.0), vec2(76.0, 76.0));
     match texture {
         Some(id) => {
             painter.image(
@@ -1202,8 +1026,8 @@ fn picture_tile(
         }
     }
     painter.text(
-        pos2(lift.center().x, lift.max.y - 11.0),
-        egui::Align2::CENTER_CENTER,
+        pos2(rect.center().x, rect.max.y - 11.0),
+        Align2::CENTER_CENTER,
         label,
         egui::FontId::proportional(11.5),
         SEPIA,
@@ -1230,65 +1054,17 @@ fn hover_card(
     })
 }
 
-fn build_panel(ui: &mut egui::Ui, project: &mut Project, tool: &mut Tool, thumbs: &Thumbs) {
-    theme::title(ui, "The workshop");
-    theme::ornament(ui);
-
-    ui.horizontal(|ui| {
-        ui.label("Level");
-        if ui.button("‹").clicked() {
-            tools::change_level(project, project.level.saturating_sub(1));
-        }
-        let top = project.top_level();
-        let roofs_here = project
-            .layout
-            .on_level(project.level)
-            .any(|p| matches!(p.kind, PartKind::Roof(_)));
-        let walls_here = project
-            .layout
-            .on_level(project.level)
-            .any(|p| matches!(p.kind, PartKind::Wall(_)));
-        let name = if project.level > 0 && roofs_here && !walls_here {
-            "Roofs".to_string()
-        } else {
-            urbanitas::export::svg::level_name(project.level)
-        };
-        ui.label(RichText::new(name).color(SEPIA));
-        if ui.button("›").clicked() {
-            tools::change_level(project, (project.level + 1).min(top + 1));
-        }
-    });
-    ui.horizontal(|ui| {
-        ui.label("Walls");
-        for (mode, label) in [
-            (WallMode::Up, "Up"),
-            (WallMode::Cutaway, "Cutaway"),
-            (WallMode::Down, "Down"),
-        ] {
-            if ui.selectable_label(project.walls == mode, label).clicked() && project.walls != mode
-            {
-                project.walls = mode;
-                let level = project.level;
-                project.mark(&[level]);
-            }
-        }
-    });
-
-    ui.add_space(6.0);
-    theme::title(ui, "Catalogue");
-    theme::ornament(ui);
-    if ui
-        .selectable_label(tool.item.is_none(), "Select & move")
-        .clicked()
-    {
-        tool.pick(None);
-    }
+fn build_list(
+    ui: &mut egui::Ui,
+    project: &mut Project,
+    tool: &mut Tool,
+    state: &mut HudState,
+    thumbs: &Thumbs,
+) {
     ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(4.0, 4.0);
         for category in Category::ALL {
-            if ui
-                .selectable_label(tool.category == category, category.label())
-                .clicked()
-                && tool.category != category
+            if choice(ui, category.label(), tool.category == category) && tool.category != category
             {
                 tool.category = category;
                 // A tool from another category is put away, so clicks don't place it.
@@ -1301,7 +1077,7 @@ fn build_panel(ui: &mut egui::Ui, project: &mut Project, tool: &mut Tool, thumbs
             }
         }
     });
-    ui.add_space(4.0);
+    ui.add_space(8.0);
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
         for item in Item::catalogue(tool.category) {
@@ -1319,46 +1095,57 @@ fn build_panel(ui: &mut egui::Ui, project: &mut Project, tool: &mut Tool, thumbs
             }
         }
     });
+    ui.add_space(8.0);
     match tool.item {
         Some(Item::Building) => {
-            egui::CollapsingHeader::new("New building settings")
+            egui::CollapsingHeader::new("New house settings")
+                .id_salt("new_house")
                 .default_open(true)
                 .show(ui, |ui| building_grid(ui, &mut project.site.building));
         }
         Some(Item::Street) => note(
             ui,
-            "Houses take the Town panel's style, density and design mix.",
+            "Houses take the Town step's style, density and design mix.",
         ),
-        Some(i) if i.placement() != Placement::Brush => {
-            note(ui, "Snaps to a 0.5 m grid · hold Alt to place freely")
-        }
         _ => {}
+    }
+    more_link(ui, &mut state.more);
+    if state.more {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Floor");
+            if ui.button("‹").clicked() {
+                tools::change_level(project, project.level.saturating_sub(1));
+            }
+            ui.label(RichText::new(urbanitas::export::svg::level_name(project.level)).color(SEPIA));
+            if ui.button("›").clicked() {
+                tools::change_level(project, (project.level + 1).min(project.top_level() + 1));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Walls");
+            for (mode, label) in [
+                (WallMode::Up, "Up"),
+                (WallMode::Cutaway, "Cutaway"),
+                (WallMode::Down, "Down"),
+            ] {
+                if choice(ui, label, project.walls == mode) && project.walls != mode {
+                    project.walls = mode;
+                    let level = project.level;
+                    project.mark(&[level]);
+                }
+            }
+        });
     }
 }
 
-fn designs_panel(
-    ui: &mut egui::Ui,
-    project: &mut Project,
-    tool: &mut Tool,
-    state: &mut HudState,
-    thumbs: &Thumbs,
-) {
-    theme::title(ui, "Designs");
-    theme::ornament(ui);
+fn designs_list(ui: &mut egui::Ui, project: &mut Project, tool: &mut Tool, thumbs: &Thumbs) {
     match project.selected_group.or(project.open_group) {
         Some(g) => {
-            if state.design_name_for != Some(g) {
-                state.design_name_for = Some(g);
-                state.design_name = tools::house_name(project, g);
+            let name = tools::house_name(project, g);
+            if primary(ui, &format!("Save {name} as a design")) {
+                save_design(project, g, &name);
             }
-            ui.label(RichText::new("Save this house as a design").color(SEPIA));
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut state.design_name).desired_width(170.0));
-                if ui.button("Save design").clicked() {
-                    let name = state.design_name.trim().to_string();
-                    save_design(project, g, if name.is_empty() { "House" } else { &name });
-                }
-            });
             let linked = project
                 .layout
                 .module(g)
@@ -1374,10 +1161,7 @@ fn designs_panel(
                 ui.add_space(4.0);
                 note(
                     ui,
-                    &format!(
-                        "A copy of “{}” ({copies} in this town).",
-                        project.designs[index].name
-                    ),
+                    &format!("A copy of {} ({copies} here).", project.designs[index].name),
                 );
                 ui.horizontal(|ui| {
                     if ui
@@ -1398,23 +1182,18 @@ fn designs_panel(
                 });
             }
         }
-        None => note(
-            ui,
-            "Shift+click a house (generated or hand-built) to save it as a design.",
-        ),
+        None => note(ui, "Click a house in the view to save it as a design."),
     }
-
-    ui.add_space(8.0);
-    theme::title(ui, "Library");
-    theme::ornament(ui);
+    ui.add_space(10.0);
     if project.designs.is_empty() {
-        note(ui, "No designs yet.");
+        note(ui, "Saved designs appear here.");
         return;
     }
     note(
         ui,
-        "Click a design, then click the map to place a copy (R turns it). Right-click for more.",
+        "Click a design, then click the map to place a copy (R turns it). Right-click to delete.",
     );
+    ui.add_space(4.0);
     let mut delete = None;
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
@@ -1465,7 +1244,7 @@ fn save_design(project: &mut Project, group: u32, name: &str) {
         return;
     };
     match files::save_design(&design) {
-        Ok(path) => {
+        Ok(_) => {
             project.edit(&[], None, |l| {
                 let module = l.module_mut(group);
                 module.design = Some(id);
@@ -1473,7 +1252,7 @@ fn save_design(project: &mut Project, group: u32, name: &str) {
             });
             project.designs.push(design);
             project.designs.sort_by(|a, b| a.name.cmp(&b.name));
-            project.status = format!("Design saved: {name} ({})", path.display());
+            project.status = format!("Design saved: {name}");
         }
         Err(err) => project.status = format!("Could not save the design: {err}"),
     }
@@ -1501,19 +1280,228 @@ fn update_all_copies(project: &mut Project, group: u32, index: usize) {
     project.status = format!("Updated {count} copies of {name}");
 }
 
+// ---------------------------------------------------------------------------------------
+// The card that follows the selection.
+
+/// The corners of what's selected, in the world: a house's plot up to its roof, or a part.
+fn selection_corners(project: &Project) -> Vec<Vec3> {
+    let layout = &project.layout;
+    let (rect, low, high) = if let Some(g) = project.selected_group {
+        let Some(lot) = layout
+            .module(g)
+            .and_then(|m| m.lot)
+            .or_else(|| tools::group_bounds(layout, g))
+        else {
+            return Vec::new();
+        };
+        let ground = layout
+            .group_parts(g)
+            .filter(|p| p.level == 0)
+            .map(|p| p.ground)
+            .fold(f64::MAX, f64::min);
+        let ground = if ground == f64::MAX { 0.0 } else { ground };
+        let top = layout.elevation(project.group_levels(g).last().copied().unwrap_or(0));
+        (lot, ground, ground + top)
+    } else if let Some(part) = project.selected.and_then(|id| layout.get(id)) {
+        let base = layout.base(part);
+        (part.footprint(), base, base + 2.0)
+    } else {
+        return Vec::new();
+    };
+    let mut corners = Vec::with_capacity(8);
+    for y in [low, high] {
+        for (x, z) in [
+            (rect.x, rect.z),
+            (rect.x1(), rect.z),
+            (rect.x, rect.z1()),
+            (rect.x1(), rect.z1()),
+        ] {
+            corners.push(Vec3::new(x as f32, y as f32, z as f32));
+        }
+    }
+    corners
+}
+
+#[allow(clippy::too_many_arguments)]
+fn floating_card(
+    ctx: &egui::Context,
+    project: &mut Project,
+    tool: &mut Tool,
+    state: &mut HudState,
+    thumbs: &Thumbs,
+    camera: &Camera,
+    transform: &GlobalTransform,
+    left_edge: f32,
+    now: f64,
+) {
+    let corners = selection_corners(project);
+    if corners.is_empty() {
+        return;
+    }
+    let view = ctx.viewport_rect();
+    let on_screen: Vec<egui::Pos2> = corners
+        .iter()
+        .filter_map(|c| camera.world_to_viewport(transform, *c).ok())
+        .map(|p| pos2(p.x, p.y))
+        .collect();
+    let seen = on_screen.iter().any(|p| view.contains(*p));
+    // Beside the selection, on whichever side has room; in the top corner if it's out of view.
+    let pos = if seen {
+        let left = on_screen.iter().map(|p| p.x).fold(f32::MAX, f32::min);
+        let right = on_screen.iter().map(|p| p.x).fold(f32::MIN, f32::max);
+        let middle = on_screen.iter().map(|p| p.y).sum::<f32>() / on_screen.len() as f32;
+        let last = view.right() - CARD_WIDTH - MARGIN;
+        let x = if right + 16.0 <= last {
+            right + 16.0
+        } else {
+            left - CARD_WIDTH - 16.0
+        };
+        pos2(
+            x.clamp(left_edge, last.max(left_edge)),
+            (middle - 90.0).clamp(MARGIN, (view.bottom() - 340.0).max(MARGIN)),
+        )
+    } else {
+        pos2(view.right() - CARD_WIDTH - MARGIN, 60.0)
+    };
+    egui::Area::new(egui::Id::new("selection_card"))
+        .fixed_pos(pos)
+        .order(egui::Order::Middle)
+        .show(ctx, |ui| {
+            card().inner_margin(Margin::same(10)).show(ui, |ui| {
+                ui.set_width(CARD_WIDTH - 20.0);
+                if let Some(g) = project.selected_group {
+                    house_card(ui, project, tool, state, g, now);
+                } else if let Some(part) = project
+                    .selected
+                    .and_then(|id| project.layout.get(id).cloned())
+                {
+                    part_card(ui, project, thumbs, &part);
+                }
+            });
+        });
+}
+
+/// The card's close button. Returns whether it was clicked.
+fn card_close(ui: &mut egui::Ui) -> bool {
+    ui.small_button("×").on_hover_text("Deselect").clicked()
+}
+
+fn house_card(
+    ui: &mut egui::Ui,
+    project: &mut Project,
+    tool: &mut Tool,
+    state: &mut HudState,
+    group: u32,
+    now: f64,
+) {
+    let mut name = tools::house_name(project, group);
+    ui.horizontal(|ui| {
+        if ui
+            .add(
+                egui::TextEdit::singleline(&mut name)
+                    .desired_width(CARD_WIDTH - 56.0)
+                    .font(egui::FontId::new(16.0, theme::heading_family())),
+            )
+            .changed()
+        {
+            let key = format!("name-{group}");
+            project.edit(&[], Some(&key), |l| l.module_mut(group).name = name.clone());
+        }
+        if card_close(ui) {
+            project.selected_group = None;
+            state.card_colours = false;
+        }
+    });
+    let storeys = project
+        .layout
+        .group_parts(group)
+        .filter(|p| matches!(p.kind, PartKind::Wall(_)))
+        .map(|p| p.level)
+        .max()
+        .map_or(0, |l| l + 1);
+    let copy = project
+        .layout
+        .module(group)
+        .and_then(|m| m.design.clone())
+        .and_then(|id| project.designs.iter().find(|d| d.id == id))
+        .map(|d| format!(" · copy of {}", d.name))
+        .unwrap_or_default();
+    note(ui, &format!("{storeys} storeys{copy}"));
+    ui.add_space(2.0);
+    let half = vec2((CARD_WIDTH - 26.0) / 2.0, 28.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        if ui.add_sized(half, egui::Button::new("Turn")).clicked() {
+            tools::turn_group(project, group);
+        }
+        if ui
+            .add_sized(half, egui::Button::new("Edit inside"))
+            .clicked()
+        {
+            tools::open_house(project, group);
+            state.panel = Some(Panel::Build);
+            state.panel_at = now;
+            state.more = true;
+            tool.pick(None);
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        if ui
+            .add_sized(half, egui::Button::new("Save design"))
+            .clicked()
+        {
+            let name = tools::house_name(project, group);
+            save_design(project, group, &name);
+            tool.pick(None);
+            project.placing_piazza = false;
+            state.panel = Some(Panel::Designs);
+            state.panel_at = now;
+        }
+        if ui
+            .add_sized(
+                half,
+                egui::Button::new(RichText::new("Delete").color(TERRACOTTA)),
+            )
+            .clicked()
+        {
+            tools::delete_group(project, group);
+        }
+    });
+    if ui
+        .link(RichText::new("Colours").color(SEPIA_SOFT))
+        .clicked()
+    {
+        state.card_colours = !state.card_colours;
+    }
+    if state.card_colours && project.selected_group == Some(group) {
+        palette_editor(ui, project, Some(group));
+    }
+}
+
+fn part_card(ui: &mut egui::Ui, project: &mut Project, thumbs: &Thumbs, part: &Part) {
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(part.label()).strong().color(GOLD));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if card_close(ui) {
+                project.selected = None;
+            }
+        });
+    });
+    if let Some(id) = thumbs.preview() {
+        let width = CARD_WIDTH - 20.0;
+        ui.add(
+            egui::Image::new(egui::load::SizedTexture::new(
+                id,
+                [width, width * 168.0 / 264.0],
+            ))
+            .corner_radius(6),
+        );
+    }
+    inspector(ui, project, part);
+}
+
 fn inspector(ui: &mut egui::Ui, project: &mut Project, part: &Part) {
-    ui.label(RichText::new(part.label()).strong().color(GOLD));
-    let building = part
-        .group
-        .map_or("no house".to_string(), |g| tools::house_name(project, g));
-    ui.label(
-        RichText::new(format!(
-            "Level {} · {building} · part #{}",
-            part.level, part.id
-        ))
-        .small()
-        .color(SEPIA_SOFT),
-    );
     let id = part.id;
     let level = part.level;
     let mut edited = part.clone();
@@ -1589,7 +1577,7 @@ fn inspector(ui: &mut egui::Ui, project: &mut Project, part: &Part) {
     }
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        if ui.button("Rotate 90°").clicked() {
+        if ui.button("Turn").clicked() {
             tools::rotate_selected(project, id);
         }
         if ui
@@ -1608,293 +1596,15 @@ fn inspector(ui: &mut egui::Ui, project: &mut Project, part: &Part) {
 }
 
 // ---------------------------------------------------------------------------------------
-// Floating pieces: bubbles, the selection card, banners, toasts and the minimap.
+// Notices and the minimap.
 
-fn bubbles(
-    ctx: &egui::Context,
-    x: f32,
-    middle: f32,
-    project: &mut Project,
-    tool: &mut Tool,
-    state: &mut HudState,
-) {
-    let size = 40.0;
-    let gap = 8.0;
-    let count = Sculpt::ALL.len() as f32 + 1.0;
-    let top = middle - (count * (size + gap)) / 2.0;
-    let mut active_y = None;
-    egui::Area::new(egui::Id::new("bubbles"))
-        .fixed_pos(pos2(x, top))
-        .order(egui::Order::Middle)
-        .show(ctx, |ui| {
-            ui.spacing_mut().item_spacing = vec2(0.0, gap);
-            for sculpt in Sculpt::ALL {
-                let item = Item::Terrain(sculpt);
-                let active = tool.item == Some(item);
-                let response =
-                    icon_button(ui, Icon::Sculpt(sculpt), size, active, true, item.label());
-                if active {
-                    active_y = Some(response.rect.center().y);
-                }
-                if response.clicked() {
-                    state.water_open = false;
-                    if active {
-                        // A click on the lit bubble puts the brush away.
-                        tool.pick(None);
-                        project.status = "Brush put away".into();
-                    } else {
-                        if project.mode != Mode::Build {
-                            project.mode = Mode::Build;
-                            project.mark_all();
-                        }
-                        tool.pick(Some(item));
-                        project.selected = None;
-                        project.selected_group = None;
-                        project.status = format!(
-                            "{}: hold the left button and paint · houses are spared",
-                            item.label()
-                        );
-                    }
-                }
-            }
-            let response =
-                icon_button(ui, Icon::Water, size, state.water_open, true, "Water level");
-            if state.water_open {
-                active_y = Some(response.rect.center().y);
-            }
-            if response.clicked() {
-                state.water_open = !state.water_open;
-                if matches!(tool.item, Some(Item::Terrain(_))) {
-                    tool.pick(None);
-                }
-            }
-        });
-    let Some(y) = active_y else { return };
-    // The popover beside the lit bubble.
-    egui::Area::new(egui::Id::new("bubble_popover"))
-        .fixed_pos(pos2(x + size + 12.0, y - 40.0))
-        .order(egui::Order::Middle)
-        .show(ctx, |ui| {
-            card().inner_margin(Margin::same(10)).show(ui, |ui| {
-                ui.set_width(210.0);
-                if state.water_open {
-                    ui.label(RichText::new("Water level").strong().color(GOLD));
-                    match project.layout.water.as_ref().map(|w| w.level) {
-                        Some(level) => {
-                            ui.label(RichText::new(format!("{level:+.1} m")).color(SEPIA));
-                            ui.horizontal(|ui| {
-                                for (label, rise) in [("Lower 0.5 m", -0.5), ("Raise 0.5 m", 0.5)] {
-                                    if ui.button(label).clicked() {
-                                        project.edit(&[], Some("water"), |l| {
-                                            if let Some(w) = l.water.as_mut() {
-                                                w.shift(rise);
-                                            }
-                                        });
-                                        project.mark_terrain();
-                                    }
-                                }
-                            });
-                        }
-                        None => note(ui, "This landscape has no water. Pick a sea, lake or river in the Landscape panel."),
-                    }
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.label("Size");
-                        ui.add(egui::Slider::new(&mut tool.brush_radius, 1.0..=30.0).suffix(" m"));
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Strength");
-                        ui.add(egui::Slider::new(&mut tool.brush_strength, 0.1..=2.0));
-                    });
-                    note(ui, "Houses, piazzas and terraces are left alone.");
-                }
-            });
-        });
-}
-
-/// Where on screen to pin the selection's card: above the selected house or part.
-fn selection_anchor(project: &Project) -> Option<Vec3> {
-    let layout = &project.layout;
-    if let Some(g) = project.selected_group {
-        let lot = layout
-            .module(g)
-            .and_then(|m| m.lot)
-            .or_else(|| tools::group_bounds(layout, g))?;
-        let (cx, cz) = lot.center();
-        let ground = layout
-            .group_parts(g)
-            .filter(|p| p.level == 0)
-            .map(|p| p.ground)
-            .fold(f64::MAX, f64::min);
-        let ground = if ground == f64::MAX { 0.0 } else { ground };
-        let top = layout.elevation(project.group_levels(g).last().copied().unwrap_or(0));
-        return Some(Vec3::new(cx as f32, (ground + top + 1.0) as f32, cz as f32));
-    }
-    let part = layout.get(project.selected?)?;
-    let (cx, cz) = part.footprint().center();
-    Some(Vec3::new(
-        cx as f32,
-        (layout.base(part) + 1.5) as f32,
-        cz as f32,
-    ))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn floating_card(
-    ctx: &egui::Context,
-    project: &mut Project,
-    state: &mut HudState,
-    thumbs: &Thumbs,
-    camera: &Camera,
-    transform: &GlobalTransform,
-    left_edge: f32,
-) {
-    let Some(anchor) = selection_anchor(project) else {
-        return;
-    };
-    let view = ctx.viewport_rect();
-    let width = 270.0;
-    let target = camera
-        .world_to_viewport(transform, anchor)
-        .ok()
-        .map(|p| pos2(p.x, p.y))
-        .filter(|p| view.contains(*p));
-    // Beside the selection when it's on screen, docked at the right otherwise.
-    let pos = match target {
-        Some(p) => pos2(
-            (p.x + 46.0).clamp(left_edge + 70.0, view.right() - width - 16.0),
-            (p.y - 120.0).clamp(view.top() + 70.0, view.bottom() - 420.0),
-        ),
-        None => pos2(view.right() - width - 16.0, view.top() + 70.0),
-    };
-    let response = egui::Area::new(egui::Id::new("selection_card"))
-        .fixed_pos(pos)
-        .order(egui::Order::Middle)
-        .show(ctx, |ui| {
-            card().show(ui, |ui| {
-                ui.set_width(width - 24.0);
-                ui.horizontal(|ui| {
-                    ui.with_layout(UiLayout::right_to_left(Align::Min), |ui| {
-                        if ui.small_button("×").on_hover_text("Deselect").clicked() {
-                            project.selected = None;
-                            project.selected_group = None;
-                        }
-                    });
-                });
-                if let Some(id) = thumbs.preview() {
-                    ui.add(
-                        egui::Image::new(egui::load::SizedTexture::new(
-                            id,
-                            [width - 24.0, (width - 24.0) * 168.0 / 264.0],
-                        ))
-                        .corner_radius(6),
-                    );
-                }
-                if let Some(g) = project.selected_group {
-                    house_card(ui, project, state, g);
-                } else if let Some(part) = project
-                    .selected
-                    .and_then(|id| project.layout.get(id).cloned())
-                {
-                    inspector(ui, project, &part);
-                }
-            });
-        })
-        .response;
-    // A thin leader from the card to what it describes.
-    if let Some(p) = target {
-        let from = pos2(response.rect.left(), response.rect.top() + 40.0);
-        let painter = ctx.layer_painter(egui::LayerId::new(
-            egui::Order::Background,
-            egui::Id::new("leader"),
-        ));
-        painter.line_segment([from, p], egui::Stroke::new(1.5, GOLD));
-        painter.circle_filled(p, 4.0, GOLD);
-    }
-}
-
-fn house_card(ui: &mut egui::Ui, project: &mut Project, state: &mut HudState, group: u32) {
-    let mut name = tools::house_name(project, group);
-    ui.horizontal(|ui| {
-        if ui
-            .add(
-                egui::TextEdit::singleline(&mut name)
-                    .desired_width(200.0)
-                    .font(egui::FontId::new(17.0, theme::heading_family())),
-            )
-            .changed()
-        {
-            let key = format!("name-{group}");
-            project.edit(&[], Some(&key), |l| l.module_mut(group).name = name.clone());
-        }
-    });
-    let parts = project.layout.group_parts(group).count();
-    let storeys = project
-        .layout
-        .group_parts(group)
-        .filter(|p| matches!(p.kind, PartKind::Wall(_)))
-        .map(|p| p.level)
-        .max()
-        .map_or(0, |l| l + 1);
-    let copy = project
-        .layout
-        .module(group)
-        .and_then(|m| m.design.clone())
-        .and_then(|id| project.designs.iter().find(|d| d.id == id))
-        .map(|d| format!(" · copy of {}", d.name))
-        .unwrap_or_default();
-    note(ui, &format!("{parts} parts · {storeys} storeys{copy}"));
-    ui.add_space(4.0);
-    ui.horizontal_wrapped(|ui| {
-        if ui
-            .button("Turn")
-            .on_hover_text("A quarter turn (R)")
-            .clicked()
-        {
-            tools::turn_group(project, group);
-        }
-        if ui
-            .button("Open house")
-            .on_hover_text("Edit its parts on their own")
-            .clicked()
-        {
-            tools::open_house(project, group);
-        }
-        if ui.button("Save design").clicked() {
-            state.panel = Some(Panel::Designs);
-        }
-        if ui.button("Colours").clicked() {
-            state.panel = Some(Panel::Colours);
-        }
-        if ui
-            .button(RichText::new("Delete").color(TERRACOTTA))
-            .clicked()
-        {
-            tools::delete_group(project, group);
-        }
-    });
-}
-
-fn hint_banner(ctx: &egui::Context, y: f32, text: &str) {
-    egui::Area::new(egui::Id::new("hint_banner"))
-        .anchor(egui::Align2::CENTER_TOP, vec2(0.0, y))
-        .order(egui::Order::Middle)
-        .show(ctx, |ui| {
-            card()
-                .inner_margin(Margin::symmetric(16, 8))
-                .show(ui, |ui| {
-                    ui.label(RichText::new(text).color(SEPIA));
-                });
-        });
-}
-
-fn open_house_banner(ctx: &egui::Context, y: f32, project: &mut Project, group: u32) {
+fn open_house_banner(ctx: &egui::Context, project: &mut Project, group: u32) {
     egui::Area::new(egui::Id::new("open_house"))
-        .anchor(egui::Align2::CENTER_TOP, vec2(0.0, y))
+        .anchor(Align2::CENTER_TOP, vec2(0.0, MARGIN))
         .order(egui::Order::Middle)
         .show(ctx, |ui| {
             card()
-                .inner_margin(Margin::symmetric(16, 8))
+                .inner_margin(Margin::symmetric(14, 6))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
@@ -1909,46 +1619,41 @@ fn open_house_banner(ctx: &egui::Context, y: f32, project: &mut Project, group: 
         });
 }
 
-/// Short notices in the bottom right that fade in and away.
-fn toasts(ctx: &egui::Context, state: &HudState, bottom: f32, now: f64) {
-    let view = ctx.viewport_rect();
-    let mut y = bottom;
-    for (k, (text, at)) in state.toasts.iter().enumerate().rev() {
-        let age = now - at;
-        let alpha =
-            ((age / 0.25).min(1.0) * ((TOAST_SECONDS - age) / 0.6).min(1.0)).clamp(0.0, 1.0) as f32;
-        let slide = (1.0 - ease((age / 0.25).min(1.0) as f32)) * 30.0;
-        let response = egui::Area::new(egui::Id::new(("toast", k)))
-            .pivot(egui::Align2::RIGHT_BOTTOM)
-            .fixed_pos(pos2(view.right() - 16.0 + slide, y))
-            .order(egui::Order::Foreground)
-            .interactable(false)
-            .show(ctx, |ui| {
-                ui.multiply_opacity(alpha);
-                card()
-                    .inner_margin(Margin::symmetric(14, 8))
-                    .show(ui, |ui| {
-                        ui.set_max_width(320.0);
-                        ui.label(RichText::new(text).color(SEPIA));
-                    });
-            })
-            .response;
-        y = response.rect.top() - 8.0;
+/// The latest notice, at the top, fading away.
+fn toast(ctx: &egui::Context, state: &HudState, y: f32, now: f64) {
+    let Some((text, at)) = &state.toast else {
+        return;
+    };
+    let age = now - at;
+    if age >= TOAST_SECONDS {
+        return;
     }
+    let alpha = ((age / 0.15).min(1.0) * ((TOAST_SECONDS - age) / 0.5).min(1.0)) as f32;
+    egui::Area::new(egui::Id::new("toast"))
+        .anchor(Align2::CENTER_TOP, vec2(0.0, y))
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .show(ctx, |ui| {
+            ui.multiply_opacity(alpha);
+            card()
+                .inner_margin(Margin::symmetric(14, 8))
+                .show(ui, |ui| {
+                    ui.label(RichText::new(text).color(SEPIA));
+                });
+        });
 }
 
-/// The minimap: ground, water, streets and houses from above, with the camera's focus.
-/// Clicking it moves the camera there. Returns its top edge.
+/// The minimap, in the top corner: ground, water, streets and houses from above, with the
+/// camera's focus. Clicking it moves the camera there.
 fn minimap(
     ctx: &egui::Context,
     state: &mut HudState,
     project: &Project,
     orbit: &mut PanOrbitCamera,
-    bottom: f32,
     now: f64,
-) -> f32 {
+) {
     let Some(terrain) = project.layout.terrain.as_ref() else {
-        return bottom - 10.0;
+        return;
     };
     const N: usize = 128;
     let stale = state
@@ -1970,20 +1675,15 @@ fn minimap(
         }
     }
     let Some((handle, _)) = state.minimap.as_ref() else {
-        return bottom - 10.0;
+        return;
     };
-    let size = 172.0;
-    let view = ctx.viewport_rect();
-    let rect = egui::Rect::from_min_size(
-        pos2(view.right() - size - 16.0, bottom - size - 16.0),
-        vec2(size, size),
-    );
+    let size = 150.0;
     let rect_world = terrain.rect;
     egui::Area::new(egui::Id::new("minimap"))
-        .fixed_pos(rect.min - vec2(6.0, 6.0))
+        .anchor(Align2::RIGHT_TOP, vec2(-MARGIN, MARGIN))
         .order(egui::Order::Middle)
         .show(ctx, |ui| {
-            card().inner_margin(Margin::same(6)).show(ui, |ui| {
+            card().inner_margin(Margin::same(5)).show(ui, |ui| {
                 let (area, response) =
                     ui.allocate_exact_size(vec2(size, size), egui::Sense::click_and_drag());
                 let painter = ui.painter_at(area);
@@ -1994,20 +1694,13 @@ fn minimap(
                     Color32::WHITE,
                 );
                 // World ↔ map: north (+z) is up.
-                let to_map = |x: f32, z: f32| {
-                    pos2(
-                        area.left()
-                            + (x - rect_world.x as f32) / rect_world.w as f32 * area.width(),
-                        area.bottom()
-                            - (z - rect_world.z as f32) / rect_world.d as f32 * area.height(),
-                    )
-                };
-                let focus = to_map(orbit.focus.x, orbit.focus.z);
-                let yaw = orbit.yaw.unwrap_or(0.0);
-                let look = vec2(-yaw.sin(), yaw.cos()) * 14.0;
-                painter.line_segment(
-                    [focus, focus + vec2(look.x, look.y)],
-                    egui::Stroke::new(2.0, TERRACOTTA),
+                let focus = pos2(
+                    area.left()
+                        + (orbit.focus.x - rect_world.x as f32) / rect_world.w as f32
+                            * area.width(),
+                    area.bottom()
+                        - (orbit.focus.z - rect_world.z as f32) / rect_world.d as f32
+                            * area.height(),
                 );
                 painter.circle_filled(focus, 4.0, TERRACOTTA);
                 painter.circle_stroke(focus, 6.0, egui::Stroke::new(1.0, PARCHMENT_LIGHT));
@@ -2025,7 +1718,6 @@ fn minimap(
                 response.on_hover_text("Click to look here");
             });
         });
-    rect.top() - 18.0
 }
 
 fn minimap_image(project: &Project, n: usize) -> egui::ColorImage {
@@ -2126,9 +1818,9 @@ mod tests {
     }
 
     #[test]
-    fn easing_runs_from_zero_to_one() {
-        assert_eq!(super::ease(0.0), 0.0);
-        assert_eq!(super::ease(1.0), 1.0);
-        assert!(super::ease(0.5) > 0.5);
+    fn only_build_and_designs_open_the_parts_panel() {
+        use super::Panel;
+        assert!(Panel::Build.has_parts() && Panel::Designs.has_parts());
+        assert!(!Panel::Land.has_parts() && !Panel::Town.has_parts());
     }
 }

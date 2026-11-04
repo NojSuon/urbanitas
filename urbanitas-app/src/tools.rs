@@ -1,7 +1,7 @@
-//! Build mode: the parts catalogue, Sims-style placement with grid snapping (or free
-//! placement while Alt is held), whole-house selection, streets that fill with houses,
-//! design copies, terrain sculpting, moving, turning, deleting and the ghost preview.
-//! In Generate mode, a click places the town's piazza.
+//! Working in the view: the parts catalogue, Sims-style placement with grid snapping (or
+//! free placement while Alt is held), selecting houses and parts, streets that fill with
+//! houses, design copies, terrain sculpting, moving, turning, deleting and the ghost
+//! preview. A click can also place the town's piazza.
 
 use std::f64::consts::{FRAC_PI_2, PI};
 
@@ -16,7 +16,7 @@ use urbanitas::style::OpeningSpec;
 use urbanitas::terrain::{Brush, Terrain};
 use urbanitas::{BuildingParams, fill_street, generate, piazza_check};
 
-use crate::project::{Mode, Project};
+use crate::project::Project;
 use crate::scene::{MainCamera, bevy_mesh, merged};
 
 /// Snapping grid, in metres.
@@ -71,12 +71,12 @@ impl Category {
     pub fn label(self) -> &'static str {
         match self {
             Category::Walls => "Walls",
-            Category::Openings => "Openings",
+            Category::Openings => "Doors & windows",
             Category::Structure => "Structure",
             Category::Roofs => "Roofs",
             Category::Garden => "Garden",
             Category::Streets => "Streets",
-            Category::Buildings => "Buildings",
+            Category::Buildings => "Houses",
         }
     }
 }
@@ -354,8 +354,8 @@ pub struct Pointer {
     pub height: f64,
     /// Alt held: no snapping, fine rotation.
     pub free: bool,
-    /// Shift held: select whole buildings.
-    pub whole: bool,
+    /// Shift held: select a single part of a house, not the whole house.
+    pub single: bool,
     pub over_ui: bool,
     pub ui_wants_keyboard: bool,
     /// Pins the pointer to a spot (scripted screenshots) until the real mouse moves.
@@ -834,7 +834,7 @@ fn track_pointer(
     mut pinned_at: Local<Option<Option<Vec2>>>,
 ) {
     pointer.free = keys.pressed(KeyCode::AltLeft) || keys.pressed(KeyCode::AltRight);
-    pointer.whole = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    pointer.single = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
     let cursor = window.single().ok().and_then(Window::cursor_position);
     if let Some(forced) = pointer.forced {
         // A scripted pin holds only until a person moves the mouse.
@@ -914,9 +914,6 @@ fn keyboard(
     if keys.just_pressed(KeyCode::Escape) && project.placing_piazza {
         project.placing_piazza = false;
         project.status = "Piazza placing cancelled".into();
-        return;
-    }
-    if project.mode != Mode::Build {
         return;
     }
     let step = if pointer.free {
@@ -1041,7 +1038,6 @@ pub fn open_house(project: &mut Project, group: u32) {
     project.open_group = Some(group);
     project.selected_group = None;
     project.selected = None;
-    project.mode = Mode::Build;
     project.mark_all();
     project.status = format!(
         "Editing {} on its own · Esc or Close house when done",
@@ -1202,9 +1198,6 @@ fn mouse(
         }
         return;
     }
-    if project.mode != Mode::Build {
-        return;
-    }
 
     if tool.item == Some(Item::Street) {
         if pressed {
@@ -1225,21 +1218,16 @@ fn mouse(
             let group = hit
                 .and_then(|id| project.layout.get(id))
                 .and_then(|part| part.group);
-            if pointer.whole && group.is_some() {
+            // A click takes the whole house; Shift, or being inside an opened house, takes
+            // the single part.
+            if group.is_some() && !pointer.single && project.open_group.is_none() {
                 project.selected = None;
                 project.selected_group = group;
                 tool.moving = group.map(|g| (Grab::Group(g), p));
-                project.status = format!(
-                    "{} · drag to move · R to turn · Delete to remove",
-                    house_name(&project, group.unwrap_or(0))
-                );
             } else {
                 project.selected = hit;
                 project.selected_group = None;
                 tool.moving = hit.map(|id| (Grab::Part(id), p));
-                if let Some(id) = hit {
-                    project.status = project.layout.get(id).map(Part::label).unwrap_or_default();
-                }
             }
         }
         if released {
@@ -1394,7 +1382,7 @@ fn sculpt(
     mut tool: ResMut<Tool>,
     pointer: Res<Pointer>,
 ) {
-    let Some(Item::Terrain(kind)) = tool.item.filter(|_| project.mode == Mode::Build) else {
+    let Some(Item::Terrain(kind)) = tool.item else {
         return;
     };
     if tool.stroking && !buttons.pressed(MouseButton::Left) {
@@ -1517,7 +1505,7 @@ fn update_ghost(
     mut meshes: ResMut<Assets<Mesh>>,
     mut shown: Local<Option<Candidate>>,
 ) {
-    let wanted = if project.mode == Mode::Build && (!pointer.over_ui || tool.moving.is_some()) {
+    let wanted = if !pointer.over_ui || tool.moving.is_some() {
         candidate(&project, &tool, &pointer)
     } else {
         None
@@ -1578,9 +1566,6 @@ fn draw_gizmos(mut gizmos: Gizmos, project: Res<Project>, tool: Res<Tool>, point
             gizmos.linestrip(ring, colour);
         }
     }
-    if project.mode != Mode::Build {
-        return;
-    }
     if let Some(p) = pointer.ground {
         if let Some(Item::Terrain(_)) = tool.item {
             // The brush: a ring that follows the ground.
@@ -1593,8 +1578,8 @@ fn draw_gizmos(mut gizmos: Gizmos, project: Res<Project>, tool: Res<Tool>, point
                 })
                 .collect();
             gizmos.linestrip(ring, Color::srgb(0.71, 0.32, 0.23));
-        } else {
-            // A fading patch of grid around the pointer, like a build-mode floor grid.
+        } else if tool.item.is_some() || tool.moving.is_some() {
+            // A fading patch of grid around the pointer while placing or moving something.
             let c = snap(p, false);
             let reach = 8;
             for i in -reach..=reach {

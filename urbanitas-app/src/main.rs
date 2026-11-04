@@ -26,7 +26,7 @@ use urbanitas::{
 };
 
 use hud::{HudState, Panel};
-use project::{Mode, Project, Quality, Source};
+use project::{Project, Quality, Source};
 use tools::{Category, Item, Pointer, Sculpt, Tool};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -37,9 +37,9 @@ enum QualityArg {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Demo {
-    /// Build mode with the cutaway view, a window selected and an olive tree being placed.
+    /// The Build panel with the cutaway view, a window selected and an olive tree being placed.
     Build,
-    /// Build mode with the terrain brushes and a hill raised next to the buildings.
+    /// The Land options with a brush out and a hill raised next to the buildings.
     Terrain,
     /// The town panel, with the ghost piazza under the pointer.
     Piazza,
@@ -184,7 +184,8 @@ fn main() -> AppExit {
     }
     hud_state.panel = match args.demo {
         Some(Demo::Build) => Some(Panel::Build),
-        Some(Demo::Terrain) | Some(Demo::House) => None,
+        Some(Demo::Terrain) => Some(Panel::Land),
+        Some(Demo::House) => None,
         Some(Demo::Piazza) => Some(Panel::Town),
         Some(Demo::Designs) => Some(Panel::Designs),
         None => hud_state.panel,
@@ -228,9 +229,8 @@ fn main() -> AppExit {
     app.run()
 }
 
-/// Build mode, walls cut away, a window selected and an olive tree being placed.
+/// Walls cut away, a window selected and an olive tree being placed.
 fn stage_build_demo(project: &mut Project, tool: &mut Tool, pointer: &mut Pointer) {
-    project.mode = Mode::Build;
     project.walls = WallMode::Cutaway;
     project.level = 0;
     project.selected = project
@@ -257,9 +257,8 @@ fn stage_build_demo(project: &mut Project, tool: &mut Tool, pointer: &mut Pointe
     project.mark_all();
 }
 
-/// Build mode with the terrain tools out and a hill already raised.
+/// A brush out and a hill already raised.
 fn stage_terrain_demo(project: &mut Project, tool: &mut Tool, pointer: &mut Pointer) {
-    project.mode = Mode::Build;
     let bounds = project.layout.bounds();
     let (cx, cz) = bounds.center();
     let hill = [cx + bounds.w * 0.35, cz - bounds.d * 0.25];
@@ -281,16 +280,14 @@ fn stage_terrain_demo(project: &mut Project, tool: &mut Tool, pointer: &mut Poin
 
 /// The town panel open and the ghost piazza under the pointer, beside the town.
 fn stage_piazza_demo(project: &mut Project, pointer: &mut Pointer) {
-    project.mode = Mode::Generate;
     project.placing_piazza = true;
     let at = project.plaza.unwrap_or([0.0, 0.0]);
     pointer.forced = Some([at[0] + 70.0, at[1] + 30.0]);
     project.status = "Demo: placing a piazza".into();
 }
 
-/// Build mode with the largest house near the piazza selected.
+/// The house nearest the piazza selected.
 fn stage_house_demo(project: &mut Project) {
-    project.mode = Mode::Build;
     let plaza = project.plaza.unwrap_or([0.0, 0.0]);
     let near = (0..project.layout.palettes.len() as u32)
         .filter_map(|g| {

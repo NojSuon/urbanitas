@@ -17,7 +17,7 @@ use urbanitas::style::Palette;
 use urbanitas::terrain::Terrain;
 use urbanitas::texture;
 
-use crate::project::{Mode, Project, Quality};
+use crate::project::{Project, Quality};
 
 pub struct ScenePlugin;
 
@@ -511,7 +511,7 @@ fn track_camera_look(
         let angle = octant as f64 * std::f64::consts::FRAC_PI_4;
         look.octant = Some(octant);
         look.dir = Some([angle.cos(), angle.sin()]);
-        if project.mode == Mode::Build && project.walls == WallMode::Cutaway {
+        if project.walls == WallMode::Cutaway {
             let level = project.level;
             project.mark(&[level]);
         }
@@ -546,7 +546,7 @@ fn rebuild(
     }
     let scene = Scene::new(&project.layout);
     for &level in &levels {
-        let view = if project.mode == Mode::Build && level == project.level {
+        let view = if level == project.level {
             View {
                 walls: project.walls,
                 look: look.dir,
@@ -637,9 +637,8 @@ fn level_visibility(project: Res<Project>, mut meshes: Query<(&LevelMesh, &mut V
             .open_group
             .is_some_and(|g| mesh.group.is_some_and(|m| m != g));
         // Upper floors drop away only while you work above the ground or inside an opened house.
-        let clipped = project.mode == Mode::Build
-            && (project.level > 0 || project.open_group.is_some())
-            && mesh.level > project.level;
+        let clipped =
+            (project.level > 0 || project.open_group.is_some()) && mesh.level > project.level;
         let show = !others_hidden && !clipped;
         let wanted = if show {
             Visibility::Inherited

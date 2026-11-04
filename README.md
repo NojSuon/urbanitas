@@ -41,25 +41,18 @@ Every surface uses a procedural texture generated in Rust, so there are no image
 cargo run --release -p urbanitas-app
 ```
 
-The app opens on a hilly coast with a town already grown. The **icon rail** on the left opens panels that slide in over the view:
+The app opens on a hilly coast with a town already grown. One **toolbar at the bottom** holds the four steps. Click a step to open it, and click it again to close it and see the whole view.
 
-| Panel | What it does |
+| Step | What it does |
 | --- | --- |
-| **Landscape** | Terrain (flat, hills, mountains, valley), water (sea with a beach, cliffs or both; lake; river), map size and seed. It regenerates as you change it. Site presets: one building, a street of palazzi, villas, a farm. |
-| **Town** | Style, number of houses, density, where houses come from (generated, your designs, or mixed) and the seed. **Place the piazza** shows a ghost piazza under the pointer (green where it fits). Click and the town grows round it. **Regrow** reshuffles; **Clear town** leaves the bare land. |
-| **Build** | The parts catalogue (Buildings, Walls, Openings, Structure, Roofs, Garden, Streets) with pictures and hover cards. **Street with houses** draws a street that fills with houses on both sides. |
-| **Designs** | Save the selected house as a design. Place copies from the library (R turns them). **Update all copies** pushes changes made to one copy into the design and every other copy. |
-| **Colours** | Palette swatches and a colour picker for the selected house, or for the town. |
-| **Settings** | Quality, the minimap, key reference. |
+| **Land** | Terrain (flat, hills, mountains, valley) and water (beach, cliffs, both, lake, river), which regenerate as you change them, plus the terrain brushes: Raise, Lower, Flatten, Smooth and Sand. Hold the left button and paint. Dabs follow the cursor, each stroke is one undo step, and houses, piazzas and terraces are left untouched. *More* has the map size, brush strength, water level and site presets. |
+| **Town** | The number of houses, and **Place the piazza**: a ghost shows under the pointer (green where it fits) and a click grows the town round it. *More* has the style, density, where houses come from (generated, your designs, or mixed), **Regrow** and **Clear**. |
+| **Build** | A panel with the parts catalogue as a grid of pictures: Houses, Walls, Doors & windows, Structure, Roofs, Garden, Streets. **Street with houses** draws a street that fills with houses on both sides. *More* has the floor and the wall view. |
+| **Designs** | Your saved houses as a grid of pictures. Click one, then the map, to place a copy (R turns it). **Update all copies** pushes changes made to one copy into the design and every other copy. |
 
-**Terrain bubbles.** A column of round buttons floats beside the panels: Raise, Lower, Flatten, Smooth, Sand and Water level. Hold the left button and paint. Dabs follow the cursor, and each stroke is one undo step. Houses, piazzas and terraces are left untouched. A popover sets the size and strength. Click the lit bubble to put the brush away.
+**Houses are modules.** Click a house and a small card appears beside it: rename it, **Turn**, **Edit inside** (its parts on their own, with the rest of the town hidden), **Save design**, **Delete** and **Colours**. To pick a single part without opening the house, Shift+click it.
 
-**Houses are modules.** Shift+click a house to select it, and its card floats beside it:
-- rename it, turn it, delete it
-- recolour it, or save it as a design
-- **Open house** edits its parts on their own, hiding the rest of the town
-
-Toasts confirm what happened. The minimap in the corner shows the ground, water, streets and houses; click it to look somewhere else.
+The **Menu** holds New plot, Save, Open, Export, Quality, the minimap (off by default; click it to look somewhere else), the keys and the frame rate. Short notices at the top confirm what happened.
 
 | Action | How |
 | --- | --- |
@@ -68,7 +61,7 @@ Toasts confirm what happened. The minimap in the corner shows the ground, water,
 | Place trees, props, buildings, design copies | Click |
 | Snap / free placement | 0.5 m grid; **hold Alt** for free placement and 15° turns |
 | Turn | R (90°), Q / E (15° with Alt) |
-| Select, move, delete | Click (Shift: whole house), drag, Delete |
+| Select, move, delete | Click a house (Shift: a single part), drag, Delete |
 | Undo / redo | Ctrl+Z / Ctrl+Y |
 | Change level | PgUp / PgDn |
 | See inside | Walls *Up*, *Cutaway* or *Down* |
@@ -76,7 +69,7 @@ Toasts confirm what happened. The minimap in the corner shows the ground, water,
 
 **File.** *New plot*, *Save* and *Open…* use `./projects/`. Designs live in `./designs/` as `*.design.json`. *Export* writes OBJ, SVG or JSON to `./exports/<name>/` and includes your edits.
 
-**Runs on low-end PCs.** *Quality: Low* turns off shadows and anti-aliasing, halves texture sizes and uses a coarser terrain mesh. The scene is drawn as a few merged meshes per floor, house and material. Only the floors you edit are rebuilt, and terrain strokes redraw only the ground. The status bar shows FPS, triangles and rebuild time.
+**Runs on low-end PCs.** *Quality: Low* turns off shadows and anti-aliasing, halves texture sizes and uses a coarser terrain mesh. The scene is drawn as a few merged meshes per floor, house and material. Only the floors you edit are rebuilt, and terrain strokes redraw only the ground. The Menu shows FPS, triangles and rebuild time.
 
 App flags choose the starting scene and help with scripted screenshots:
 

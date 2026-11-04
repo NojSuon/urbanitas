@@ -144,34 +144,3 @@ pub fn apply(ctx: &egui::Context) {
             .insert(TextStyle::Small, FontId::proportional(11.5));
     });
 }
-
-/// A small gold rule with a lozenge in the middle, to separate sections.
-pub fn ornament(ui: &mut egui::Ui) {
-    let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 12.0), egui::Sense::hover());
-    let painter = ui.painter();
-    let y = rect.center().y;
-    let c = rect.center().x;
-    painter.hline(rect.left()..=c - 8.0, y, Stroke::new(1.0, GOLD_SOFT));
-    painter.hline(c + 8.0..=rect.right(), y, Stroke::new(1.0, GOLD_SOFT));
-    let d = 4.0;
-    painter.add(egui::Shape::convex_polygon(
-        vec![
-            egui::pos2(c, y - d),
-            egui::pos2(c + d, y),
-            egui::pos2(c, y + d),
-            egui::pos2(c - d, y),
-        ],
-        GOLD,
-        Stroke::NONE,
-    ));
-}
-
-/// A section title in the heading face.
-pub fn title(ui: &mut egui::Ui, text: &str) {
-    ui.label(
-        egui::RichText::new(text)
-            .font(FontId::new(17.0, heading_family()))
-            .color(SEPIA),
-    );
-}

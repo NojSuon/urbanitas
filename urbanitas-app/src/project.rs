@@ -14,15 +14,7 @@ use urbanitas::{
 
 const HISTORY_LIMIT: usize = 60;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Mode {
-    /// Tweak parameters and watch the landscape, town or site regenerate.
-    Generate,
-    /// Edit the site part by part.
-    Build,
-}
-
-/// What Generate builds the layout from.
+/// What the layout is generated from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     /// A landscape, with a town grown round the piazza once one is placed.
@@ -69,8 +61,7 @@ pub struct Project {
     pub designs: Vec<Design>,
     pub layout: Layout,
     pub error: Option<String>,
-    pub mode: Mode,
-    /// The level being edited in build mode; higher levels are hidden.
+    /// The level being edited; higher levels are hidden while it is above the ground.
     pub level: u32,
     pub walls: WallMode,
     pub quality: Quality,
@@ -116,7 +107,6 @@ impl Project {
             placing_piazza: false,
             designs: crate::files::list_designs(),
             error: None,
-            mode: Mode::Generate,
             level: 0,
             walls: WallMode::Up,
             quality,
@@ -137,7 +127,7 @@ impl Project {
         project
     }
 
-    /// The layout Generate would build now.
+    /// The layout the current parameters generate.
     fn generated(&self) -> Result<(Layout, String), String> {
         match self.source {
             Source::Site => generate_site(&self.site)
@@ -184,6 +174,12 @@ impl Project {
                 self.level = self.level.min(self.top_level());
                 self.status = note;
                 self.mark_all();
+            }
+            // A new landscape can leave the piazza under water: keep the land, drop the town.
+            Err(err) if self.source == Source::Landscape && self.plaza.is_some() => {
+                self.plaza = None;
+                self.regenerate();
+                self.status = format!("Town removed: {err}. Place the piazza again.");
             }
             Err(err) => {
                 self.status = format!("Can't do that: {err}");
